@@ -1,7 +1,7 @@
 manifest_version: 1
 name: hermes-oc-free-provider
 kind: model-provider
-version: 0.2.0
+version: 0.2.1
 requires_hermes: ">=0.21.3"
 description: Unofficial OpenCode free-model compatibility with Hermes-local tools
 author: Hermes community

@@ -321,8 +321,12 @@ def _wire_tools(
             mapped[name] = target_name
         else:
             wire.append(_compat_tool(name))
+    mapped_targets = set(mapped.values())
     wire.extend(
-        tool for tool in tools or [] if _tool_name(tool) not in COMPAT_TOOL_NAMES
+        tool
+        for tool in tools or []
+        if _tool_name(tool) not in COMPAT_TOOL_NAMES
+        and _tool_name(tool) not in mapped_targets
     )
     return wire, mapped
 
@@ -379,6 +383,7 @@ def _responses_content(content: Any, *, output: bool = False) -> list[dict[str, 
 
 def _responses_input(
     messages: list[dict[str, Any]],
+    mapped_tools: dict[str, str],
 ) -> tuple[list[dict[str, Any]], str]:
     instructions = ["You are opencode"]
     items: list[dict[str, Any]] = []
@@ -412,13 +417,16 @@ def _responses_input(
                 arguments = function.get("arguments") or "{}"
                 if not isinstance(arguments, str):
                     arguments = json.dumps(arguments, separators=(",", ":"))
+                name, arguments = _opencode_tool(
+                    str(function.get("name") or ""), arguments, mapped_tools
+                )
                 call_id = str(call.get("id") or call.get("call_id") or "")
                 if call_id:
                     items.append(
                         {
                             "type": "function_call",
                             "call_id": call_id,
-                            "name": str(function.get("name") or ""),
+                            "name": name,
                             "arguments": arguments,
                         }
                     )
@@ -431,7 +439,8 @@ def _responses_input(
     return items, "\n\n".join(instructions)
 
 
-def _responses_tool_choice(value: Any) -> Any:
+def _responses_tool_choice(value: Any, mapped_tools: dict[str, str]) -> Any:
+    value = _wire_tool_choice(value, mapped_tools)
     if not isinstance(value, dict):
         return value
     function = value.get("function")
@@ -589,6 +598,176 @@ def _mapped_arguments(name: str, encoded: str) -> str:
     else:
         mapped = arguments
     return json.dumps(mapped, separators=(",", ":"))
+
+
+def _opencode_arguments(name: str, encoded: str) -> str:
+    try:
+        arguments = json.loads(encoded or "{}")
+    except json.JSONDecodeError as exc:
+        raise OpenCodeError(
+            f"Hermes tool '{name}' has invalid JSON arguments in conversation history."
+        ) from exc
+    if not isinstance(arguments, dict):
+        raise OpenCodeError(
+            f"Hermes tool '{name}' arguments in conversation history must be an object."
+        )
+
+    if name == "bash":
+        mapped = {"command": _required(arguments, name, "command")}
+        if "workdir" in arguments:
+            mapped["workdir"] = arguments["workdir"]
+        if "timeout" in arguments:
+            mapped["timeout"] = max(1, int(arguments["timeout"]) * 1000)
+    elif name == "edit":
+        if arguments.get("mode", "replace") != "replace":
+            raise OpenCodeError(
+                "A non-replace Hermes patch cannot be replayed as edit."
+            )
+        mapped = {
+            "filePath": _required(arguments, name, "path"),
+            "oldString": _required(arguments, name, "old_string"),
+            "newString": _required(arguments, name, "new_string"),
+        }
+        if "replace_all" in arguments:
+            mapped["replaceAll"] = arguments["replace_all"]
+    elif name in {"glob", "grep"}:
+        mapped = {"pattern": _required(arguments, name, "pattern")}
+        if "path" in arguments:
+            mapped["path"] = arguments["path"]
+        if name == "grep" and "file_glob" in arguments:
+            mapped["include"] = arguments["file_glob"]
+    elif name == "read":
+        mapped = {"filePath": _required(arguments, name, "path")}
+        for key in ("offset", "limit"):
+            if key in arguments:
+                mapped[key] = arguments[key]
+    elif name == "skill":
+        mapped = {"name": _required(arguments, name, "name")}
+    elif name == "task":
+        tasks = _required(arguments, name, "tasks")
+        if not isinstance(tasks, list) or not tasks or not isinstance(tasks[0], dict):
+            raise OpenCodeError("Hermes delegate history cannot be replayed as task.")
+        task = tasks[0]
+        context = str(task.get("context") or "")
+        lines = context.splitlines()
+        mapped = {
+            "description": lines[0] if lines else "Delegated Hermes task",
+            "prompt": _required(task, name, "goal"),
+            "subagent_type": "general",
+        }
+        prefixes = {
+            "Requested OpenCode subagent type: ": "subagent_type",
+            "Previous task ID: ": "task_id",
+            "Requested command: ": "command",
+            "Requested background execution: ": "background",
+        }
+        for line in lines[1:]:
+            for prefix, key in prefixes.items():
+                if line.startswith(prefix):
+                    value: Any = line.removeprefix(prefix)
+                    if key == "background":
+                        value = str(value).lower() == "true"
+                    mapped[key] = value
+                    break
+    elif name == "todowrite":
+        todos = _required(arguments, name, "todos")
+        if not isinstance(todos, list) or any(
+            not isinstance(todo, dict) for todo in todos
+        ):
+            raise OpenCodeError("Hermes todo history cannot be replayed as todowrite.")
+        mapped = {
+            "todos": [
+                {
+                    "content": _required(todo, name, "content"),
+                    "status": _required(todo, name, "status"),
+                    "priority": "medium",
+                }
+                for todo in todos
+            ]
+        }
+    elif name == "webfetch":
+        urls = _required(arguments, name, "urls")
+        if not isinstance(urls, list) or not urls:
+            raise OpenCodeError(
+                "Hermes web extract history cannot be replayed as webfetch."
+            )
+        mapped = {"url": urls[0]}
+    elif name == "websearch":
+        mapped = {"query": _required(arguments, name, "query")}
+        if "limit" in arguments:
+            mapped["numResults"] = arguments["limit"]
+    elif name == "write":
+        mapped = {
+            "filePath": _required(arguments, name, "path"),
+            "content": _required(arguments, name, "content"),
+        }
+    else:
+        mapped = arguments
+    return json.dumps(mapped, separators=(",", ":"))
+
+
+def _opencode_alias(name: str, arguments: str, mapped_tools: dict[str, str]) -> str:
+    aliases = [alias for alias in COMPAT_TOOL_NAMES if mapped_tools.get(alias) == name]
+    if not aliases:
+        return name
+    if name == "search_files":
+        try:
+            target = json.loads(arguments or "{}").get("target")
+        except (AttributeError, json.JSONDecodeError):
+            target = None
+        return "glob" if target == "files" else "grep"
+    return aliases[0]
+
+
+def _opencode_tool(
+    name: str, arguments: str, mapped_tools: dict[str, str]
+) -> tuple[str, str]:
+    alias = _opencode_alias(name, arguments, mapped_tools)
+    if alias == name:
+        return name, arguments or "{}"
+    return alias, _opencode_arguments(alias, arguments)
+
+
+def _wire_messages(
+    messages: list[dict[str, Any]], mapped_tools: dict[str, str]
+) -> list[dict[str, Any]]:
+    result = []
+    for message in messages:
+        item = dict(message)
+        if item.get("role") == "assistant" and item.get("tool_calls"):
+            calls = []
+            for call in item["tool_calls"]:
+                if not isinstance(call, dict):
+                    calls.append(call)
+                    continue
+                wired_call = dict(call)
+                function = dict(call.get("function") or {})
+                arguments = function.get("arguments") or "{}"
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, separators=(",", ":"))
+                function["name"], function["arguments"] = _opencode_tool(
+                    str(function.get("name") or ""), arguments, mapped_tools
+                )
+                wired_call["function"] = function
+                calls.append(wired_call)
+            item["tool_calls"] = calls
+        result.append(item)
+    return result
+
+
+def _wire_tool_choice(value: Any, mapped_tools: dict[str, str]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    function = value.get("function")
+    if value.get("type") != "function" or not isinstance(function, dict):
+        return value
+    result = dict(value)
+    wired_function = dict(function)
+    wired_function["name"] = _opencode_alias(
+        str(wired_function.get("name") or ""), "{}", mapped_tools
+    )
+    result["function"] = wired_function
+    return result
 
 
 def _translate_tool(
@@ -1032,13 +1211,16 @@ class OpenCodeClient:
         wire_tools, mapped_tools = _wire_tools(tools)
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "system", "content": "You are opencode"}, *messages],
+            "messages": [
+                {"role": "system", "content": "You are opencode"},
+                *_wire_messages(messages, mapped_tools),
+            ],
             "tools": wire_tools,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
         optional = {
-            "tool_choice": tool_choice,
+            "tool_choice": _wire_tool_choice(tool_choice, mapped_tools),
             "temperature": temperature,
             "max_tokens": max_tokens,
             "top_p": top_p,
@@ -1112,7 +1294,7 @@ class OpenCodeClient:
         extra: dict[str, Any],
     ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
         wire_tools, mapped_tools = _wire_tools(tools)
-        input_items, instructions = _responses_input(messages)
+        input_items, instructions = _responses_input(messages, mapped_tools)
         body: dict[str, Any] = {
             "model": model,
             "input": input_items,
@@ -1124,7 +1306,7 @@ class OpenCodeClient:
             "prompt_cache_key": self._session,
         }
         optional = {
-            "tool_choice": _responses_tool_choice(tool_choice),
+            "tool_choice": _responses_tool_choice(tool_choice, mapped_tools),
             "temperature": temperature,
             "max_output_tokens": max_tokens,
             "top_p": top_p,

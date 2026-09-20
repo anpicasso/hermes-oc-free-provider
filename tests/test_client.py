@@ -202,12 +202,17 @@ class ClientTests(unittest.TestCase):
 
     def test_all_opencode_tools_map_to_available_hermes_tools(self):
         targets = list(dict.fromkeys(client.COMPAT_TOOL_TARGETS.values()))
-        wire, mapped = client._wire_tools([tool(name) for name in targets])
+        wire, mapped = client._wire_tools(
+            [*(tool(name) for name in targets), tool("hermes_probe")]
+        )
         self.assertEqual(mapped, client.COMPAT_TOOL_TARGETS)
+        wire_names = [entry["function"]["name"] for entry in wire]
         self.assertEqual(
-            [entry["function"]["name"] for entry in wire[:11]],
+            wire_names[: len(client.COMPAT_TOOL_NAMES)],
             list(client.COMPAT_TOOL_NAMES),
         )
+        self.assertTrue(set(targets).isdisjoint(wire_names))
+        self.assertIn("hermes_probe", wire_names)
         self.assertTrue(
             all(
                 entry["function"]["parameters"]
@@ -303,12 +308,91 @@ class ClientTests(unittest.TestCase):
                 )
                 self.assertEqual(name, client.COMPAT_TOOL_TARGETS[alias])
                 self.assertEqual(json.loads(encoded), expected)
+                replay_name, replay_arguments = client._opencode_tool(
+                    name, encoded, mapped
+                )
+                self.assertEqual(replay_name, alias)
+                self.assertTrue(
+                    set(client.COMPAT_TOOL_PARAMETERS[alias]["required"])
+                    <= set(json.loads(replay_arguments))
+                )
 
         wire, mapped = client._wire_tools([tool("read")])
         self.assertNotIn("read", mapped)
         self.assertIn("unavailable", wire[4]["function"]["description"])
         with self.assertRaisesRegex(client.OpenCodeError, "compatibility-only tool"):
             client._translate_tool("read", '{"filePath":"a.py"}', mapped)
+
+    def test_native_tool_history_and_choice_are_rewritten_to_aliases(self):
+        captured = {}
+
+        def fake_open(request, _timeout):
+            captured["body"] = json.loads(request.data)
+            return sse(
+                {
+                    "model": "m",
+                    "choices": [
+                        {"delta": {"content": "DONE"}, "finish_reason": "stop"}
+                    ],
+                }
+            )
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"pwd","timeout":2}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "/repo",
+            },
+        ]
+        oc = client.OpenCodeClient()
+        oc._version = "1.18.31"
+        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+            result = oc.chat.completions.create(
+                model="m",
+                messages=messages,
+                tools=[tool("terminal"), tool("hermes_probe")],
+                tool_choice={"type": "function", "function": {"name": "terminal"}},
+            )
+            self.assertEqual(result.choices[0].message.content, "DONE")
+
+        body = captured["body"]
+        names = [entry["function"]["name"] for entry in body["tools"]]
+        self.assertIn("bash", names)
+        self.assertIn("hermes_probe", names)
+        self.assertNotIn("terminal", names)
+        self.assertEqual(body["tool_choice"]["function"]["name"], "bash")
+        replay = body["messages"][1]["tool_calls"][0]["function"]
+        self.assertEqual(replay["name"], "bash")
+        self.assertEqual(
+            json.loads(replay["arguments"]), {"command": "pwd", "timeout": 2000}
+        )
+        self.assertEqual(body["messages"][2], messages[1])
+
+        mapped = {"bash": "terminal"}
+        response_input, _ = client._responses_input(messages, mapped)
+        self.assertIn(
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": '{"command":"pwd","timeout":2000}',
+            },
+            response_input,
+        )
 
     def test_streamed_bash_call_is_buffered_and_mapped_to_terminal(self):
         response = sse(

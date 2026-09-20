@@ -58,13 +58,16 @@ translates returned calls back to their native Hermes names and arguments:
 - `websearch` → `web_search`
 - `write` → `write_file`
 
-Hermes' native target tools remain available alongside those aliases; the alias
-names themselves are reserved to prevent an unrelated same-name tool from
-receiving OpenCode arguments. A mapped alias is advertised only when its target
-tool was supplied by Hermes. If the model calls an unavailable compatibility
-alias, the request fails closed—nothing is executed and no success is
-fabricated. Streamed tool arguments are buffered until their JSON is complete
-before translation.
+Mapped native targets such as `terminal` and `read_file` are hidden from the
+model to avoid duplicate capabilities; unrelated Hermes tools remain available
+under their native names. Returned alias calls are translated to native Hermes
+calls for execution, then translated back to aliases when conversation history
+is replayed to OpenCode. Explicit tool choices are translated the same way.
+
+An alias is advertised only when its target tool was supplied by Hermes. If the
+model calls an unavailable compatibility alias, the request fails
+closed—nothing is executed and no success is fabricated. Streamed tool
+arguments are buffered until their JSON is complete before translation.
 
 The adapters preserve executable intent, not every OpenCode runtime option.
 `bash.timeout` is converted from milliseconds to seconds; todo order is
