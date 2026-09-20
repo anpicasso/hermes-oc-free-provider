@@ -1,10 +1,10 @@
 manifest_version: 1
-name: hermes-oc-server-plugin
+name: hermes-oc-free-provider
 kind: model-provider
 version: 0.1.0
 requires_hermes: ">=0.21.3"
 description: Direct OpenCode free-model inference with Hermes-local tools
 author: Hermes community
-homepage: https://github.com/anpicasso/hermes-oc-server-plugin
+homepage: https://github.com/anpicasso/hermes-oc-free-provider
 license: MIT
 tags: [opencode, inference, model-provider, free-models]

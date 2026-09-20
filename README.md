@@ -1,4 +1,4 @@
-# hermes-oc-server-plugin
+# hermes-oc-free-provider
 
 A Hermes model-provider that calls OpenCode's free-model inference endpoint directly.
 It does **not** use `opencode serve` or ACP.
@@ -17,7 +17,7 @@ change its free-tier request gate without notice.
 ## Install
 
 ```bash
-hermes plugins install anpicasso/hermes-oc-server-plugin --enable
+hermes plugins install anpicasso/hermes-oc-free-provider --enable
 ```
 
 The plugin uses `npx --yes opencode-ai` for model discovery and the
