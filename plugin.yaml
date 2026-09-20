@@ -1,9 +1,9 @@
 manifest_version: 1
 name: hermes-oc-free-provider
 kind: model-provider
-version: 0.1.0
+version: 0.2.0
 requires_hermes: ">=0.21.3"
-description: Direct OpenCode free-model inference with Hermes-local tools
+description: Unofficial OpenCode free-model compatibility with Hermes-local tools
 author: Hermes community
 homepage: https://github.com/anpicasso/hermes-oc-free-provider
 license: MIT

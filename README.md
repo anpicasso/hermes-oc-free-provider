@@ -1,28 +1,78 @@
 # hermes-oc-free-provider
 
-A Hermes model-provider that calls OpenCode's free-model inference endpoint directly.
-It does **not** use `opencode serve` or ACP.
+An unofficial Hermes model-provider for OpenCode Zen free models. Hermes keeps
+control of the agent loop and executes tools locally; the provider only handles
+model discovery and inference transport.
 
-## Disclaimer
+It does **not** run `opencode serve`, ACP, or a tool-execution proxy.
 
-This is an **unofficial, reverse-engineered compatibility project intended only for personal/internal use**. It is not affiliated with, endorsed by, or supported by OpenCode.
+## Compatibility and terms notice
 
-Use of OpenCode's hosted inference services remains subject to the **current [OpenCode Terms of Use](https://opencode.ai/legal/terms-of-service)** and any applicable model/provider-specific terms. As of September 20, 2026, those terms include restrictions relating to service access, automated use, usage limits/access restrictions, and use for the benefit of third parties. This project does not grant any rights beyond those terms.
+This project is independent, unofficial, and not affiliated with or endorsed by
+OpenCode. It is intended for a user's own internal use on systems they control.
+It does not grant access to OpenCode Zen or any model, and it is not legal
+advice.
 
-Users are responsible for reviewing and complying with the current terms before using this plugin. **Do not use this project to resell or proxy OpenCode inference to third parties, evade quotas or rate limits, rotate identities/accounts to obtain additional free usage, or intentionally defeat access restrictions.**
+OpenCode's [Zen documentation](https://opencode.ai/docs/zen/) describes Zen as
+usable with other coding agents. That general interoperability statement is not
+an authorization for every client, authentication method, workload, or use
+case. This plugin's current public compatibility transport is not documented by
+OpenCode as a supported Hermes integration and may be changed or disabled at
+any time.
 
-Because this integration relies on an undocumented, reverse-engineered compatibility path, OpenCode may change or disable the behavior it depends on at any time.
+Before using the plugin, review and independently comply with the current:
 
-## Tool ownership
+- [OpenCode Terms of Service](https://opencode.ai/legal/terms-of-service)
+- [OpenCode Zen documentation](https://opencode.ai/docs/zen/)
+- terms, privacy notices, and acceptable-use rules for the selected model
 
-Hermes owns the agent loop and executes every browser, terminal, file, MCP, and
-other tool locally. The plugin forwards Hermes' native tool schemas, parses the
-model's structured tool calls, and returns them to Hermes for execution.
+In particular, use the service only when you have the right to access it. Do
+not use this project to provide inference for third parties, resell or proxy the
+service, scrape or bulk-extract outputs, evade quotas or rate limits, rotate
+accounts or identities for additional free usage, conceal prohibited activity,
+or bypass an access restriction. A disclaimer cannot make a prohibited use
+compliant. If OpenCode requires an account, API key, paid access, or a supported
+client for your intended use, do not use this compatibility transport instead.
 
-This is an independently implemented, reverse-engineered compatibility path,
-not an official OpenCode API contract. It was verified against OpenCode 1.18.31
-with real text, multi-turn, and native tool-call/result round trips. OpenCode can
-change its free-tier request gate without notice.
+Free-model labels describe pricing, not permission or privacy. Some free,
+trial, and contributor models may use prompts or completions for model
+improvement or may prohibit confidential data. Check the current Zen model
+notice before every use and never send secrets or regulated data unless the
+applicable terms expressly allow it.
+
+## Tool ownership and mapping
+
+Hermes supplies the real tool schemas, applies its normal policy and approval
+rules, executes each tool locally, and returns the result to the model. The
+plugin exposes OpenCode-compatible aliases for available Hermes tools and
+translates returned calls back to their native Hermes names and arguments:
+
+- `bash` → `terminal`
+- `edit` → `patch`
+- `glob` / `grep` → `search_files`
+- `read` → `read_file`
+- `skill` → `skill_view`
+- `task` → `delegate_task`
+- `todowrite` → `todo_list`
+- `webfetch` → `web_extract`
+- `websearch` → `web_search`
+- `write` → `write_file`
+
+Hermes' native target tools remain available alongside those aliases; the alias
+names themselves are reserved to prevent an unrelated same-name tool from
+receiving OpenCode arguments. A mapped alias is advertised only when its target
+tool was supplied by Hermes. If the model calls an unavailable compatibility
+alias, the request fails closed—nothing is executed and no success is
+fabricated. Streamed tool arguments are buffered until their JSON is complete
+before translation.
+
+The adapters preserve executable intent, not every OpenCode runtime option.
+`bash.timeout` is converted from milliseconds to seconds; todo order is
+preserved but OpenCode's priority label is discarded; OpenCode `read` directory
+listing and image-attachment behavior is not emulated; `webfetch`
+formatting/timeout hints and advanced `websearch` crawl hints have no Hermes
+equivalent; and OpenCode task metadata is passed to the Hermes subagent as
+context while Hermes controls scheduling.
 
 ## Install
 
@@ -30,10 +80,10 @@ change its free-tier request gate without notice.
 hermes plugins install anpicasso/hermes-oc-free-provider --enable
 ```
 
-The plugin uses `npx --yes opencode-ai` for model discovery and the
-client-version header. Inference itself is a direct HTTPS request.
+The plugin uses `npx --yes opencode-ai` for model discovery and the compatible
+client-version header. Inference is sent directly over HTTPS.
 
-Select the provider and one of its discovered free models:
+Select the provider and one of its discovered models:
 
 ```bash
 hermes model
@@ -42,22 +92,13 @@ hermes model
 
 ## Model discovery
 
-The plugin runs `opencode models opencode --pure`, exposing every model in the
-local OpenCode `opencode` provider. If discovery fails, it falls back to the
-last verified free-model list. It uses `/chat/completions` for OpenAI-compatible
-models and `/responses` for the two Muse contributor models, matching the local
-OpenCode catalog's provider metadata.
+The plugin runs `opencode models opencode --pure` and exposes the models in the
+local OpenCode `opencode` catalog. If discovery fails, it uses the last verified
+fallback list. It selects `/chat/completions` or `/responses` according to the
+known model transport.
 
-The `muse-spark-*-contributor-free` models may train on prompts and completions.
-Hermes displays its contributor-tier warning and requires the normal explicit
-acknowledgment before those models can run unattended.
-
-## Safety
-
-OpenCode's free endpoint currently requires baseline tool descriptors. The
-plugin sends inert compatibility descriptors, then appends the real Hermes tool
-schemas. If a model attempts a compatibility-only tool Hermes did not offer,
-the request fails closed instead of executing or pretending it succeeded.
+Model availability, pricing, retention, and data-use rules belong to OpenCode
+and the underlying provider and can change independently of this repository.
 
 ## Verify
 
@@ -66,9 +107,9 @@ python -m unittest discover -s tests -v
 hermes plugins validate . --json
 ```
 
-Hermes 0.21.3's `plugins doctor` incorrectly routes provider-only manifests
-through the standalone-plugin loader and reports a missing `register()` hook.
-The plugin intentionally registers only its model provider at import time.
+Hermes 0.21.3's `plugins doctor` routes provider-only manifests through the
+standalone-plugin loader and may report a missing `register()` hook. This plugin
+registers its model provider at import time, as required for provider plugins.
 
 ## License
 

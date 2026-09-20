@@ -55,6 +55,153 @@ COMPAT_TOOL_NAMES = (
     "websearch",
     "write",
 )
+COMPAT_TOOL_TARGETS = {
+    "bash": "terminal",
+    "edit": "patch",
+    "glob": "search_files",
+    "grep": "search_files",
+    "read": "read_file",
+    "skill": "skill_view",
+    "task": "delegate_task",
+    "todowrite": "todo_list",
+    "webfetch": "web_extract",
+    "websearch": "web_search",
+    "write": "write_file",
+}
+COMPAT_TOOL_DESCRIPTIONS = {
+    "bash": "Execute a shell command in the local workspace.",
+    "edit": "Replace exact text in a local file.",
+    "glob": "Find local files by glob pattern.",
+    "grep": "Search local file contents with a regular expression.",
+    "read": "Read a local file.",
+    "skill": "Load a Hermes skill by name.",
+    "task": "Delegate a task to a Hermes subagent.",
+    "todowrite": "Replace the current Hermes task list.",
+    "webfetch": "Extract content from a web page.",
+    "websearch": "Search the web.",
+    "write": "Write a local file.",
+}
+COMPAT_TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
+    "bash": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "timeout": {"type": "integer", "minimum": 1},
+            "workdir": {"type": "string"},
+        },
+        "required": ["command"],
+    },
+    "edit": {
+        "type": "object",
+        "properties": {
+            "filePath": {"type": "string"},
+            "oldString": {"type": "string"},
+            "newString": {"type": "string"},
+            "replaceAll": {"type": "boolean"},
+        },
+        "required": ["filePath", "oldString", "newString"],
+    },
+    "glob": {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "path": {"type": "string"},
+        },
+        "required": ["pattern"],
+    },
+    "grep": {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "path": {"type": "string"},
+            "include": {"type": "string"},
+        },
+        "required": ["pattern"],
+    },
+    "read": {
+        "type": "object",
+        "properties": {
+            "filePath": {"type": "string"},
+            "offset": {"type": "integer", "minimum": 1},
+            "limit": {"type": "integer", "minimum": 1},
+        },
+        "required": ["filePath"],
+    },
+    "skill": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    },
+    "task": {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string"},
+            "prompt": {"type": "string"},
+            "subagent_type": {"type": "string"},
+            "task_id": {"type": "string"},
+            "command": {"type": "string"},
+            "background": {"type": "boolean"},
+        },
+        "required": ["description", "prompt", "subagent_type"],
+    },
+    "todowrite": {
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "pending",
+                                "in_progress",
+                                "completed",
+                                "cancelled",
+                            ],
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                        },
+                    },
+                    "required": ["content", "status", "priority"],
+                },
+            }
+        },
+        "required": ["todos"],
+    },
+    "webfetch": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string"},
+            "format": {"type": "string", "enum": ["text", "markdown", "html"]},
+            "timeout": {"type": "integer", "minimum": 1},
+        },
+        "required": ["url"],
+    },
+    "websearch": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "numResults": {"type": "integer", "minimum": 1, "maximum": 100},
+            "livecrawl": {"type": "string"},
+            "type": {"type": "string"},
+            "contextMaxCharacters": {"type": "integer", "minimum": 1},
+        },
+        "required": ["query"],
+    },
+    "write": {
+        "type": "object",
+        "properties": {
+            "filePath": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["filePath", "content"],
+    },
+}
 _BASE62 = string.digits + string.ascii_letters
 _SESSION_LOCK = threading.Lock()
 _SESSION_COUNTER = 0
@@ -139,6 +286,22 @@ def _compat_tool(name: str) -> dict[str, Any]:
     }
 
 
+def _mapped_tool(name: str, target: dict[str, Any]) -> dict[str, Any]:
+    function = target.get("function") or {}
+    target_name = str(function.get("name") or COMPAT_TOOL_TARGETS[name])
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                f"{COMPAT_TOOL_DESCRIPTIONS[name]} "
+                f"OpenCode-compatible alias for Hermes {target_name}."
+            ),
+            "parameters": COMPAT_TOOL_PARAMETERS[name],
+        },
+    }
+
+
 def _tool_name(tool: Any) -> str:
     if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
         return ""
@@ -147,14 +310,21 @@ def _tool_name(tool: Any) -> str:
 
 def _wire_tools(
     tools: list[dict[str, Any]] | None,
-) -> tuple[list[dict[str, Any]], set[str]]:
-    actual = {_tool_name(tool) for tool in tools or []} - {""}
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     by_name = {_tool_name(tool): tool for tool in tools or [] if _tool_name(tool)}
-    wire = [by_name.get(name) or _compat_tool(name) for name in COMPAT_TOOL_NAMES]
+    mapped: dict[str, str] = {}
+    wire = []
+    for name in COMPAT_TOOL_NAMES:
+        target_name = COMPAT_TOOL_TARGETS[name]
+        if target := by_name.get(target_name):
+            wire.append(_mapped_tool(name, target))
+            mapped[name] = target_name
+        else:
+            wire.append(_compat_tool(name))
     wire.extend(
         tool for tool in tools or [] if _tool_name(tool) not in COMPAT_TOOL_NAMES
     )
-    return wire, actual
+    return wire, mapped
 
 
 def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -308,35 +478,191 @@ def _usage(value: Any = None) -> SimpleNamespace:
     )
 
 
-def _tool_calls_from_parts(parts: dict[int, dict[str, Any]]) -> list[SimpleNamespace]:
+def _required(arguments: dict[str, Any], name: str, key: str) -> Any:
+    if key not in arguments:
+        raise OpenCodeError(
+            f"OpenCode tool '{name}' omitted required argument '{key}'."
+        )
+    return arguments[key]
+
+
+def _mapped_arguments(name: str, encoded: str) -> str:
+    try:
+        arguments = json.loads(encoded or "{}")
+    except json.JSONDecodeError as exc:
+        raise OpenCodeError(
+            f"OpenCode tool '{name}' returned invalid JSON arguments."
+        ) from exc
+    if not isinstance(arguments, dict):
+        raise OpenCodeError(f"OpenCode tool '{name}' arguments must be a JSON object.")
+
+    if name == "bash":
+        mapped = {"command": _required(arguments, name, "command")}
+        if "workdir" in arguments:
+            mapped["workdir"] = arguments["workdir"]
+        if "timeout" in arguments:
+            milliseconds = int(arguments["timeout"])
+            mapped["timeout"] = max(1, (milliseconds + 999) // 1000)
+    elif name == "edit":
+        mapped = {
+            "mode": "replace",
+            "path": _required(arguments, name, "filePath"),
+            "old_string": _required(arguments, name, "oldString"),
+            "new_string": _required(arguments, name, "newString"),
+        }
+        if "replaceAll" in arguments:
+            mapped["replace_all"] = arguments["replaceAll"]
+    elif name == "glob":
+        mapped = {
+            "target": "files",
+            "pattern": _required(arguments, name, "pattern"),
+        }
+        if "path" in arguments:
+            mapped["path"] = arguments["path"]
+    elif name == "grep":
+        mapped = {
+            "target": "content",
+            "pattern": _required(arguments, name, "pattern"),
+        }
+        if "path" in arguments:
+            mapped["path"] = arguments["path"]
+        if "include" in arguments:
+            mapped["file_glob"] = arguments["include"]
+    elif name == "read":
+        mapped = {"path": _required(arguments, name, "filePath")}
+        for key in ("offset", "limit"):
+            if key in arguments:
+                mapped[key] = arguments[key]
+    elif name == "skill":
+        mapped = {"name": _required(arguments, name, "name")}
+    elif name == "task":
+        context = [
+            str(_required(arguments, name, "description")),
+            f"Requested OpenCode subagent type: {_required(arguments, name, 'subagent_type')}",
+        ]
+        for key, label in (
+            ("task_id", "Previous task ID"),
+            ("command", "Requested command"),
+            ("background", "Requested background execution"),
+        ):
+            if key in arguments:
+                context.append(f"{label}: {arguments[key]}")
+        mapped = {
+            "tasks": [
+                {
+                    "goal": _required(arguments, name, "prompt"),
+                    "context": "\n".join(context),
+                }
+            ]
+        }
+    elif name == "todowrite":
+        todos = _required(arguments, name, "todos")
+        if not isinstance(todos, list):
+            raise OpenCodeError(
+                "OpenCode tool 'todowrite' argument 'todos' must be a list."
+            )
+        mapped = {
+            "todos": [
+                {
+                    "id": f"oc-{index + 1}",
+                    "content": _required(todo, name, "content"),
+                    "status": _required(todo, name, "status"),
+                }
+                for index, todo in enumerate(todos)
+                if isinstance(todo, dict)
+            ],
+            "merge": False,
+        }
+        if len(mapped["todos"]) != len(todos):
+            raise OpenCodeError("OpenCode tool 'todowrite' contains a non-object item.")
+    elif name == "webfetch":
+        mapped = {"urls": [_required(arguments, name, "url")]}
+    elif name == "websearch":
+        mapped = {"query": _required(arguments, name, "query")}
+        if "numResults" in arguments:
+            mapped["limit"] = max(1, min(100, int(arguments["numResults"])))
+    elif name == "write":
+        mapped = {
+            "path": _required(arguments, name, "filePath"),
+            "content": _required(arguments, name, "content"),
+        }
+    else:
+        mapped = arguments
+    return json.dumps(mapped, separators=(",", ":"))
+
+
+def _translate_tool(
+    name: str, arguments: str, mapped_tools: dict[str, str]
+) -> tuple[str, str]:
+    if error := _phantom_tool_error(name, mapped_tools):
+        raise error
+    target = mapped_tools.get(name, name)
+    if target != name:
+        arguments = _mapped_arguments(name, arguments)
+    return target, arguments or "{}"
+
+
+def _tool_calls_from_parts(
+    parts: dict[int, dict[str, Any]], mapped_tools: dict[str, str]
+) -> list[SimpleNamespace]:
     result = []
     for index in sorted(parts):
         call = parts[index]
+        name, arguments = _translate_tool(
+            str(call.get("name") or ""),
+            str(call.get("arguments") or "{}"),
+            mapped_tools,
+        )
         result.append(
             SimpleNamespace(
                 id=call.get("id") or f"call_{index}",
                 call_id=call.get("id") or f"call_{index}",
                 type=call.get("type") or "function",
-                function=SimpleNamespace(
-                    name=call.get("name") or "", arguments=call.get("arguments") or "{}"
-                ),
+                function=SimpleNamespace(name=name, arguments=arguments),
                 response_item_id=None,
             )
         )
     return result
 
 
-def _phantom_tool_error(name: str, actual: set[str]) -> OpenCodeError | None:
-    if name in COMPAT_TOOL_NAMES and name not in actual:
+def _tool_call_dicts(
+    parts: dict[int, dict[str, Any]], mapped_tools: dict[str, str]
+) -> list[dict[str, Any]]:
+    result = []
+    for index in sorted(parts):
+        call = parts[index]
+        name, arguments = _translate_tool(
+            str(call.get("name") or ""),
+            str(call.get("arguments") or "{}"),
+            mapped_tools,
+        )
+        result.append(
+            {
+                "index": index,
+                "id": call.get("id") or f"call_{index}",
+                "type": call.get("type") or "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+    return result
+
+
+def _phantom_tool_error(
+    name: str, mapped_tools: dict[str, str]
+) -> OpenCodeError | None:
+    if name in COMPAT_TOOL_NAMES and name not in mapped_tools:
         return OpenCodeError(
             f"OpenCode attempted compatibility-only tool '{name}'. "
-            "It was not supplied by Hermes and was not executed."
+            "No matching Hermes tool was supplied, so it was not executed."
         )
     return None
 
 
 def _merge_sse(
-    events: Iterator[dict[str, Any]], *, requested_model: str, actual_tools: set[str]
+    events: Iterator[dict[str, Any]],
+    *,
+    requested_model: str,
+    mapped_tools: dict[str, str],
 ) -> SimpleNamespace:
     content: list[str] = []
     reasoning: list[str] = []
@@ -379,13 +705,13 @@ def _merge_sse(
                 if function.get("name"):
                     item["name"] = str(function["name"])
                 item["arguments"] += str(function.get("arguments") or "")
-                if error := _phantom_tool_error(item["name"], actual_tools):
+                if error := _phantom_tool_error(item["name"], mapped_tools):
                     raise error
     if not seen:
         raise OpenCodeError("OpenCode inference returned no events.")
     if finish_reason == "content_filter":
         raise OpenCodeError("OpenCode inference was blocked by the content filter.")
-    tool_calls = _tool_calls_from_parts(calls)
+    tool_calls = _tool_calls_from_parts(calls, mapped_tools)
     text = "".join(content) or None
     thought = "".join(reasoning) or None
     return SimpleNamespace(
@@ -408,6 +734,71 @@ def _merge_sse(
         ],
         usage=_usage(usage),
     )
+
+
+def _stream_sse(
+    events: Iterator[dict[str, Any]],
+    *,
+    requested_model: str,
+    mapped_tools: dict[str, str],
+) -> Iterator[dict[str, Any]]:
+    calls: dict[int, dict[int, dict[str, Any]]] = {}
+    model = requested_model
+    seen = False
+    for event in events:
+        seen = True
+        if event.get("error"):
+            raise OpenCodeError(f"OpenCode inference error: {event['error']}")
+        model = str(event.get("model") or model)
+        event.setdefault("choices", [])
+        for choice in event.get("choices") or []:
+            if choice.get("finish_reason") == "content_filter":
+                raise OpenCodeError(
+                    "OpenCode inference was blocked by the content filter."
+                )
+            choice_index = int(choice.get("index", 0) or 0)
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+                choice["delta"] = delta
+            raw_calls = delta.pop("tool_calls", [])
+            choice_calls = calls.get(choice_index, {})
+            for raw_call in raw_calls:
+                choice_calls = calls.setdefault(choice_index, {})
+                index = int(raw_call.get("index", 0) or 0)
+                item = choice_calls.setdefault(
+                    index,
+                    {"id": "", "type": "function", "name": "", "arguments": ""},
+                )
+                if raw_call.get("id"):
+                    item["id"] = str(raw_call["id"])
+                item["type"] = str(raw_call.get("type") or item["type"])
+                function = raw_call.get("function") or {}
+                if function.get("name"):
+                    item["name"] = str(function["name"])
+                item["arguments"] += str(function.get("arguments") or "")
+                if error := _phantom_tool_error(item["name"], mapped_tools):
+                    raise error
+            if choice.get("finish_reason") and choice_calls:
+                delta["tool_calls"] = _tool_call_dicts(choice_calls, mapped_tools)
+                calls.pop(choice_index)
+        yield event
+    if not seen:
+        raise OpenCodeError("OpenCode inference returned no events.")
+    if calls:
+        yield {
+            "model": model,
+            "choices": [
+                {
+                    "index": choice_index,
+                    "delta": {
+                        "tool_calls": _tool_call_dicts(choice_calls, mapped_tools)
+                    },
+                    "finish_reason": "tool_calls",
+                }
+                for choice_index, choice_calls in sorted(calls.items())
+            ],
+        }
 
 
 def _next_or_done(iterator: Iterator[Any]) -> tuple[bool, Any]:
@@ -560,7 +951,7 @@ class OpenCodeClient:
         selected = str(model or DEFAULT_MODEL)
 
         def factory() -> SimpleNamespace:
-            events, actual = self._direct_events(
+            events, mapped_tools = self._direct_events(
                 selected,
                 messages or [],
                 tools or [],
@@ -573,13 +964,15 @@ class OpenCodeClient:
                 extra_body=extra_body,
                 extra=kwargs,
             )
-            return _merge_sse(events, requested_model=selected, actual_tools=actual)
+            return _merge_sse(
+                events, requested_model=selected, mapped_tools=mapped_tools
+            )
 
         if not stream:
             return _LazyValue(factory)
 
         def stream_factory() -> Iterator[SimpleNamespace]:
-            events, actual = self._direct_events(
+            events, mapped_tools = self._direct_events(
                 selected,
                 messages or [],
                 tools or [],
@@ -592,30 +985,10 @@ class OpenCodeClient:
                 extra_body=extra_body,
                 extra=kwargs,
             )
-            call_names: dict[int, str] = {}
-            seen = False
-            for event in events:
-                seen = True
-                if event.get("error"):
-                    raise OpenCodeError(f"OpenCode inference error: {event['error']}")
-                event.setdefault("choices", [])
-                for choice in event.get("choices") or []:
-                    if choice.get("finish_reason") == "content_filter":
-                        raise OpenCodeError(
-                            "OpenCode inference was blocked by the content filter."
-                        )
-                    for raw_call in (choice.get("delta") or {}).get("tool_calls") or []:
-                        index = int(raw_call.get("index", 0) or 0)
-                        name = str((raw_call.get("function") or {}).get("name") or "")
-                        if name:
-                            call_names[index] = name
-                        if error := _phantom_tool_error(
-                            call_names.get(index, ""), actual
-                        ):
-                            raise error
+            for event in _stream_sse(
+                events, requested_model=selected, mapped_tools=mapped_tools
+            ):
                 yield _namespace(event)
-            if not seen:
-                raise OpenCodeError("OpenCode inference returned no events.")
 
         return _LazyStream(stream_factory)
 
@@ -633,7 +1006,7 @@ class OpenCodeClient:
         stop: Any,
         extra_body: dict[str, Any] | None,
         extra: dict[str, Any],
-    ) -> tuple[Iterator[dict[str, Any]], set[str]]:
+    ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
         if self.is_closed:
             raise OpenCodeError("OpenCode client is closed.")
         if "/" in model:
@@ -656,7 +1029,7 @@ class OpenCodeClient:
                 extra_body=extra_body,
                 extra=extra,
             )
-        wire_tools, actual = _wire_tools(tools)
+        wire_tools, mapped_tools = _wire_tools(tools)
         body: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "system", "content": "You are opencode"}, *messages],
@@ -722,7 +1095,7 @@ class OpenCodeClient:
                     if payload:
                         yield json.loads(payload)
 
-        return events(), actual
+        return events(), mapped_tools
 
     def _responses_events(
         self,
@@ -737,8 +1110,8 @@ class OpenCodeClient:
         top_p: Any,
         extra_body: dict[str, Any] | None,
         extra: dict[str, Any],
-    ) -> tuple[Iterator[dict[str, Any]], set[str]]:
-        wire_tools, actual = _wire_tools(tools)
+    ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
+        wire_tools, mapped_tools = _wire_tools(tools)
         input_items, instructions = _responses_input(messages)
         body: dict[str, Any] = {
             "model": model,
@@ -924,4 +1297,4 @@ class OpenCodeClient:
             if not seen:
                 raise OpenCodeError("OpenCode inference returned no events.")
 
-        return events(), actual
+        return events(), mapped_tools

@@ -43,6 +43,17 @@ def sse(*events):
     )
 
 
+def tool(name):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": f"Hermes {name}",
+            "parameters": {"type": "object"},
+        },
+    }
+
+
 class ClientTests(unittest.TestCase):
     def test_session_id_matches_opencode_shape(self):
         self.assertRegex(client._session_id(), r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
@@ -187,6 +198,188 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(
             result.choices[0].message.reasoning_details,
             [{"type": "reasoning.text", "text": "r"}],
+        )
+
+    def test_all_opencode_tools_map_to_available_hermes_tools(self):
+        targets = list(dict.fromkeys(client.COMPAT_TOOL_TARGETS.values()))
+        wire, mapped = client._wire_tools([tool(name) for name in targets])
+        self.assertEqual(mapped, client.COMPAT_TOOL_TARGETS)
+        self.assertEqual(
+            [entry["function"]["name"] for entry in wire[:11]],
+            list(client.COMPAT_TOOL_NAMES),
+        )
+        self.assertTrue(
+            all(
+                entry["function"]["parameters"]
+                == client.COMPAT_TOOL_PARAMETERS[entry["function"]["name"]]
+                for entry in wire[:11]
+            )
+        )
+
+        cases = {
+            "bash": (
+                {"command": "pwd", "timeout": 1501, "workdir": "/repo"},
+                {"command": "pwd", "timeout": 2, "workdir": "/repo"},
+            ),
+            "edit": (
+                {
+                    "filePath": "a.py",
+                    "oldString": "old",
+                    "newString": "new",
+                    "replaceAll": True,
+                },
+                {
+                    "mode": "replace",
+                    "path": "a.py",
+                    "old_string": "old",
+                    "new_string": "new",
+                    "replace_all": True,
+                },
+            ),
+            "glob": (
+                {"pattern": "*.py", "path": "src"},
+                {"target": "files", "pattern": "*.py", "path": "src"},
+            ),
+            "grep": (
+                {"pattern": "TODO", "path": "src", "include": "*.py"},
+                {
+                    "target": "content",
+                    "pattern": "TODO",
+                    "path": "src",
+                    "file_glob": "*.py",
+                },
+            ),
+            "read": (
+                {"filePath": "a.py", "offset": 2, "limit": 4},
+                {"path": "a.py", "offset": 2, "limit": 4},
+            ),
+            "skill": ({"name": "pdf"}, {"name": "pdf"}),
+            "task": (
+                {
+                    "description": "Inspect",
+                    "prompt": "Inspect the parser",
+                    "subagent_type": "explore",
+                    "background": True,
+                },
+                {
+                    "tasks": [
+                        {
+                            "goal": "Inspect the parser",
+                            "context": "Inspect\nRequested OpenCode subagent type: explore\nRequested background execution: True",
+                        }
+                    ]
+                },
+            ),
+            "todowrite": (
+                {
+                    "todos": [
+                        {"content": "Ship", "status": "in_progress", "priority": "high"}
+                    ]
+                },
+                {
+                    "todos": [
+                        {"id": "oc-1", "content": "Ship", "status": "in_progress"}
+                    ],
+                    "merge": False,
+                },
+            ),
+            "webfetch": (
+                {"url": "https://example.com", "format": "html", "timeout": 5},
+                {"urls": ["https://example.com"]},
+            ),
+            "websearch": (
+                {"query": "Hermes", "numResults": 8, "livecrawl": "always"},
+                {"query": "Hermes", "limit": 8},
+            ),
+            "write": (
+                {"filePath": "a.txt", "content": "hello"},
+                {"path": "a.txt", "content": "hello"},
+            ),
+        }
+        for alias, (arguments, expected) in cases.items():
+            with self.subTest(alias=alias):
+                name, encoded = client._translate_tool(
+                    alias, json.dumps(arguments), mapped
+                )
+                self.assertEqual(name, client.COMPAT_TOOL_TARGETS[alias])
+                self.assertEqual(json.loads(encoded), expected)
+
+        wire, mapped = client._wire_tools([tool("read")])
+        self.assertNotIn("read", mapped)
+        self.assertIn("unavailable", wire[4]["function"]["description"])
+        with self.assertRaisesRegex(client.OpenCodeError, "compatibility-only tool"):
+            client._translate_tool("read", '{"filePath":"a.py"}', mapped)
+
+    def test_streamed_bash_call_is_buffered_and_mapped_to_terminal(self):
+        response = sse(
+            {
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": '{"command":"printf',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": ' hi","timeout":1500}'},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+        oc = client.OpenCodeClient()
+        oc._version = "1.18.31"
+        with mock.patch.object(client, "_urlopen", return_value=response):
+            chunks = list(
+                oc.chat.completions.create(
+                    model="m", messages=[], tools=[tool("terminal")], stream=True
+                )
+            )
+        calls = [
+            call
+            for chunk in chunks
+            for choice in chunk.choices
+            for call in getattr(choice.delta, "tool_calls", [])
+        ]
+        self.assertEqual(calls[0].function.name, "terminal")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"command": "printf hi", "timeout": 2},
         )
 
     def test_stream_error_is_explicit_and_session_is_stable(self):
