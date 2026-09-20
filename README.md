@@ -40,29 +40,34 @@ improvement or may prohibit confidential data. Check the current Zen model
 notice before every use and never send secrets or regulated data unless the
 applicable terms expressly allow it.
 
-## Tool ownership and mapping
+## Bidirectional tool translation
 
-Hermes supplies the real tool schemas, applies its normal policy and approval
-rules, executes each tool locally, and returns the result to the model. The
-plugin exposes OpenCode-compatible aliases for available Hermes tools and
-translates returned calls back to their native Hermes names and arguments:
+Hermes remains the agent runtime: it applies its normal policy and approval
+rules, executes tools locally, and returns each result to the model. The plugin
+is a bidirectional adapter between OpenCode's tool vocabulary and Hermes':
 
-- `bash` → `terminal`
-- `edit` → `patch`
-- `glob` / `grep` → `search_files`
-- `read` → `read_file`
-- `skill` → `skill_view`
-- `task` → `delegate_task`
-- `todowrite` → `todo_list`
-- `webfetch` → `web_extract`
-- `websearch` → `web_search`
-- `write` → `write_file`
+1. **Hermes → OpenCode:** available native Hermes schemas are exposed under
+   their OpenCode-compatible names. Their native duplicates are omitted, while
+   unrelated Hermes tools remain available under their native names.
+2. **OpenCode → Hermes:** model tool calls are translated back to native Hermes
+   names and argument shapes before local dispatch.
+3. **Hermes → OpenCode continuation:** recorded native calls are translated
+   back to OpenCode names and arguments when conversation history is replayed,
+   keeping the model on one consistent vocabulary. Tool results retain their
+   call IDs and payloads. Explicit tool choices are translated the same way.
 
-Mapped native targets such as `terminal` and `read_file` are hidden from the
-model to avoid duplicate capabilities; unrelated Hermes tools remain available
-under their native names. Returned alias calls are translated to native Hermes
-calls for execution, then translated back to aliases when conversation history
-is replayed to OpenCode. Explicit tool choices are translated the same way.
+The bidirectional pairs are:
+
+- `bash` ↔ `terminal`
+- `edit` ↔ `patch`
+- `glob` / `grep` ↔ `search_files`
+- `read` ↔ `read_file`
+- `skill` ↔ `skill_view`
+- `task` ↔ `delegate_task`
+- `todowrite` ↔ `todo_list`
+- `webfetch` ↔ `web_extract`
+- `websearch` ↔ `web_search`
+- `write` ↔ `write_file`
 
 An alias is advertised only when its target tool was supplied by Hermes. If the
 model calls an unavailable compatibility alias, the request fails
