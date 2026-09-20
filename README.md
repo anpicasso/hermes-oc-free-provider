@@ -3,6 +3,16 @@
 A Hermes model-provider that calls OpenCode's free-model inference endpoint directly.
 It does **not** use `opencode serve` or ACP.
 
+## Disclaimer
+
+This is an **unofficial, reverse-engineered compatibility project intended only for personal/internal use**. It is not affiliated with, endorsed by, or supported by OpenCode.
+
+Use of OpenCode's hosted inference services remains subject to the **current [OpenCode Terms of Use](https://opencode.ai/legal/terms-of-service)** and any applicable model/provider-specific terms. As of September 20, 2026, those terms include restrictions relating to service access, automated use, usage limits/access restrictions, and use for the benefit of third parties. This project does not grant any rights beyond those terms.
+
+Users are responsible for reviewing and complying with the current terms before using this plugin. **Do not use this project to resell or proxy OpenCode inference to third parties, evade quotas or rate limits, rotate identities/accounts to obtain additional free usage, or intentionally defeat access restrictions.**
+
+Because this integration relies on an undocumented, reverse-engineered compatibility path, OpenCode may change or disable the behavior it depends on at any time.
+
 ## Tool ownership
 
 Hermes owns the agent loop and executes every browser, terminal, file, MCP, and
