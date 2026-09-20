@@ -1,4 +1,4 @@
-# hermes-oc-free-provider
+# oc-free-provider
 
 An unofficial Hermes model-provider for OpenCode Zen free models. Hermes keeps
 control of the agent loop and executes tools locally; the provider only handles
@@ -85,11 +85,12 @@ context while Hermes controls scheduling.
 ## Install
 
 ```bash
-hermes plugins install anpicasso/hermes-oc-free-provider --enable
+hermes plugins install oc-free-provider --enable
 ```
 
-The plugin uses `npx --yes opencode-ai` for model discovery and the compatible
-client-version header. Inference is sent directly over HTTPS.
+The plugin does not install or run the OpenCode CLI, Node.js, npm, or `npx`.
+Model discovery and inference use Python's standard-library HTTPS client, so the
+same code path works on Linux, macOS, and Windows.
 
 Select the provider and one of its discovered models:
 
@@ -100,10 +101,15 @@ hermes model
 
 ## Model discovery
 
-The plugin runs `opencode models opencode --pure` and exposes the models in the
-local OpenCode `opencode` catalog. If discovery fails, it uses the last verified
-fallback list. It selects `/chat/completions` or `/responses` according to the
-known model transport.
+The plugin intersects OpenCode Zen's live `/v1/models` response with the
+OpenCode catalog metadata published by [models.dev](https://models.dev/). It
+exposes only live, tool-capable models whose published input/output/cache costs
+are all zero. The resulting intersection—not the full upstream responses—is
+cached for the gateway process and persisted under the active Hermes profile.
+Each new gateway process queries both endpoints once; if refresh fails or finds
+no qualifying model, the plugin uses the last successful intersection, then
+the verified entries bundled with it when no cache exists. It selects
+`/chat/completions` or `/responses` according to the known model transport.
 
 Model availability, pricing, retention, and data-use rules belong to OpenCode
 and the underlying provider and can change independently of this repository.
@@ -115,9 +121,8 @@ python -m unittest discover -s tests -v
 hermes plugins validate . --json
 ```
 
-Hermes 0.21.3's `plugins doctor` routes provider-only manifests through the
-standalone-plugin loader and may report a missing `register()` hook. This plugin
-registers its model provider at import time, as required for provider plugins.
+`hermes plugins doctor .` also verifies runtime discovery, import, and provider
+registration.
 
 ## License
 

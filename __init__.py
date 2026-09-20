@@ -36,8 +36,6 @@ class OpenCodeFreeProfile(ProviderProfile):
         client = OpenCodeClient(
             api_key=api_key,
             base_url=base_url or self.base_url,
-            command=self.process_command,
-            args=list(self.process_args),
         )
         try:
             return client.list_models(timeout=timeout) or None
@@ -56,8 +54,9 @@ opencode_free = OpenCodeFreeProfile(
     auth_type="external_process",
     env_vars=(),
     base_url=LOGICAL_BASE_URL,
-    process_command="npx",
-    process_args=("--yes", "opencode-ai"),
+    # Hermes 0.21 routes credential-free custom clients through this seam. The
+    # executable is Hermes' own Python; the provider never spawns it.
+    process_command=sys.executable,
     process_command_env_vars=(),
     fallback_models=FALLBACK_MODELS,
     default_aux_model=DEFAULT_MODEL,

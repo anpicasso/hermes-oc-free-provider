@@ -8,24 +8,26 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import re
 import secrets
-import shutil
-import signal
 import string
-import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+
 DIRECT_URL = "https://opencode.ai/zen/v1/chat/completions"
 RESPONSES_URL = "https://opencode.ai/zen/v1/responses"
+ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+MODELS_DEV_URL = "https://models.dev/api.json"
 LOGICAL_BASE_URL = DIRECT_URL
+OPENCODE_VERSION = "1.18.31"
+OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
 FALLBACK_MODELS = (
     DEFAULT_MODEL,
@@ -205,6 +207,8 @@ COMPAT_TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
 _BASE62 = string.digits + string.ascii_letters
 _SESSION_LOCK = threading.Lock()
 _SESSION_COUNTER = 0
+_MODEL_SNAPSHOT: tuple[str, ...] | None = None
+_MODEL_SNAPSHOT_LOCK = threading.Lock()
 
 
 class OpenCodeError(RuntimeError):
@@ -221,34 +225,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def _run_opencode(
-    argv: list[str], *, timeout: float
-) -> subprocess.CompletedProcess[str]:
-    from tools.environments.local import (  # type: ignore[import-not-found]
-        hermes_subprocess_env,
-    )
-
-    process = subprocess.Popen(
-        argv,
-        env=hermes_subprocess_env(inherit_credentials=False),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=os.name != "nt",
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            process.kill()
-        else:
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        raise
-    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
-
-
 def _status_error(code: int, body: str, context: str) -> OpenCodeError:
     exc = OpenCodeError(f"{context} failed with HTTP {code}: {body[:500]}")
     exc.status_code = code
@@ -257,6 +233,96 @@ def _status_error(code: int, body: str, context: str) -> OpenCodeError:
 
 def _urlopen(request: urllib.request.Request, timeout: float):
     return _OPENER.open(request, timeout=timeout)
+
+
+def _json_get(url: str, timeout: float) -> Any:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": OPENCODE_USER_AGENT},
+    )
+    with _urlopen(request, timeout) as response:
+        return json.load(response)
+
+
+def _free_live_models(zen: Any, catalog: Any) -> list[str]:
+    zen_models = {
+        str(item.get("id") or "")
+        for item in (zen.get("data") if isinstance(zen, dict) else []) or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    provider = catalog.get("opencode") if isinstance(catalog, dict) else None
+    metadata = provider.get("models") if isinstance(provider, dict) else None
+    if not isinstance(metadata, dict):
+        return []
+
+    free = []
+    for model, details in metadata.items():
+        if not isinstance(details, dict) or details.get("status") == "deprecated":
+            continue
+        costs = details.get("cost")
+        if (
+            model in zen_models
+            and details.get("tool_call") is True
+            and isinstance(costs, dict)
+            and costs
+            and all(
+                isinstance(cost, (int, float))
+                and not isinstance(cost, bool)
+                and cost == 0
+                for cost in costs.values()
+            )
+        ):
+            free.append(str(model))
+    return sorted(free)
+
+
+def _model_cache_path() -> Path:
+    return get_hermes_home() / "cache" / "oc-free-provider" / "models.json"
+
+
+def _load_model_cache() -> list[str]:
+    try:
+        models = json.loads(_model_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(models, list) or any(
+        not isinstance(model, str) or not model for model in models
+    ):
+        return []
+    return sorted(dict.fromkeys(models))
+
+
+def _save_model_cache(models: list[str]) -> None:
+    path = _model_cache_path()
+    temporary = path.with_suffix(f".{secrets.token_hex(4)}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(models) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _models_for_process(timeout: float) -> tuple[str, ...]:
+    global _MODEL_SNAPSHOT
+    with _MODEL_SNAPSHOT_LOCK:
+        if _MODEL_SNAPSHOT is None:
+            try:
+                models = _free_live_models(
+                    _json_get(ZEN_MODELS_URL, timeout),
+                    _json_get(MODELS_DEV_URL, timeout),
+                )
+            except (OSError, ValueError, urllib.error.URLError):
+                models = []
+            if models:
+                _save_model_cache(models)
+            else:
+                models = _load_model_cache() or list(FALLBACK_MODELS)
+            _MODEL_SNAPSHOT = tuple(models)
+        return _MODEL_SNAPSHOT
 
 
 def _session_id() -> str:
@@ -1053,62 +1119,21 @@ class OpenCodeClient:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        command: str | None = None,
-        args: list[str] | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "opencode-public"
         self.base_url = base_url or LOGICAL_BASE_URL
-        self.command = command or "opencode"
-        self.command_argv = [self.command, *(args or [])]
-        if (
-            self.command == "opencode"
-            and not shutil.which(self.command)
-            and shutil.which("npx")
-        ):
-            # ponytail: official package fallback; a configured binary always wins.
-            self.command_argv = ["npx", "--yes", "opencode-ai"]
         self.chat = SimpleNamespace(
             completions=SimpleNamespace(create=self._create_chat_completion)
         )
         self.is_closed = False
-        self._version: str | None = None
         self._session = _session_id()
 
     def close(self) -> None:
         self.is_closed = True
 
-    def _opencode_version(self) -> str:
-        if self._version is not None:
-            return self._version
-        try:
-            probe = _run_opencode([*self.command_argv, "--version"], timeout=15)
-            match = re.search(r"\d+\.\d+(?:\.\d+)?", probe.stdout)
-            if match is None:
-                match = re.search(r"\d+\.\d+(?:\.\d+)?", probe.stderr)
-            self._version = match.group(0) if match else "1.18.31"
-        except (OSError, subprocess.SubprocessError):
-            self._version = "1.18.31"
-        return self._version
-
     def list_models(self, *, timeout: float = 15.0) -> list[str]:
-        try:
-            probe = _run_opencode(
-                [*self.command_argv, "models", "opencode", "--pure"],
-                timeout=timeout,
-            )
-            if probe.returncode:
-                return list(FALLBACK_MODELS)
-            models = []
-            for line in probe.stdout.splitlines():
-                model = line.strip()
-                if model.startswith("opencode/"):
-                    model = model.split("/", 1)[1]
-                if model and not any(char.isspace() for char in model):
-                    models.append(model)
-            return sorted(dict.fromkeys(models)) or list(FALLBACK_MODELS)
-        except (OSError, subprocess.SubprocessError):
-            return list(FALLBACK_MODELS)
+        return list(_models_for_process(timeout))
 
     def _create_chat_completion(
         self,
@@ -1249,7 +1274,7 @@ class OpenCodeClient:
                 "Authorization": "Bearer public",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "User-Agent": f"opencode/{self._opencode_version()}",
+                "User-Agent": OPENCODE_USER_AGENT,
                 "x-opencode-session": self._session,
             },
         )
@@ -1341,7 +1366,7 @@ class OpenCodeClient:
                 "Authorization": "Bearer public",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "User-Agent": f"opencode/{self._opencode_version()}",
+                "User-Agent": OPENCODE_USER_AGENT,
                 "x-opencode-session": self._session,
             },
         )

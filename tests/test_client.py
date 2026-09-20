@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -98,7 +99,6 @@ class ClientTests(unittest.TestCase):
             )
 
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         tool = {
             "type": "function",
             "function": {
@@ -138,7 +138,6 @@ class ClientTests(unittest.TestCase):
 
     def test_repeated_tool_identity_and_reasoning_details_are_preserved(self):
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         response = sse(
             {
                 "model": "m",
@@ -359,7 +358,6 @@ class ClientTests(unittest.TestCase):
             },
         ]
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", side_effect=fake_open):
             result = oc.chat.completions.create(
                 model="m",
@@ -447,7 +445,6 @@ class ClientTests(unittest.TestCase):
             },
         )
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", return_value=response):
             chunks = list(
                 oc.chat.completions.create(
@@ -481,7 +478,6 @@ class ClientTests(unittest.TestCase):
             )
 
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", side_effect=fake_open):
             stream = oc.chat.completions.create(model="m", messages=[], stream=True)
             with self.assertRaisesRegex(client.OpenCodeError, "inference error"):
@@ -533,7 +529,6 @@ class ClientTests(unittest.TestCase):
             },
         ]
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", side_effect=fake_open):
             result = oc.chat.completions.create(model="m", messages=messages, tools=[])
             self.assertEqual(result.choices[0].message.content, "TOOL_OK")
@@ -619,7 +614,6 @@ class ClientTests(unittest.TestCase):
             },
         }
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", side_effect=fake_open):
             first = oc.chat.completions.create(
                 model="muse-spark-1.3-contributor-free",
@@ -675,7 +669,6 @@ class ClientTests(unittest.TestCase):
 
     def test_compatibility_only_tool_call_fails_closed(self):
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         response = sse(
             {
                 "model": "m",
@@ -708,7 +701,6 @@ class ClientTests(unittest.TestCase):
             client.DIRECT_URL, 429, "rate", {}, io.BytesIO(b"busy")
         )
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", side_effect=error):
             result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaises(client.OpenCodeError) as caught:
@@ -717,7 +709,6 @@ class ClientTests(unittest.TestCase):
 
     def test_empty_and_content_filtered_responses_fail_explicitly(self):
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         with mock.patch.object(client, "_urlopen", return_value=sse()):
             with self.assertRaisesRegex(client.OpenCodeError, "no events"):
                 _ = oc.chat.completions.create(model="m", messages=[]).choices
@@ -741,7 +732,6 @@ class ClientTests(unittest.TestCase):
             )
 
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
 
         async def run():
             completion = await oc.chat.completions.create(model="m", messages=[])
@@ -764,7 +754,6 @@ class ClientTests(unittest.TestCase):
 
     def test_closed_client_fails_before_network(self):
         oc = client.OpenCodeClient()
-        oc._version = "1.18.31"
         oc.close()
         with mock.patch.object(client, "_urlopen") as open_request:
             result = oc.chat.completions.create(model="m", messages=[])
@@ -772,18 +761,61 @@ class ClientTests(unittest.TestCase):
                 _ = result.choices
         open_request.assert_not_called()
 
-    def test_catalog_uses_local_opencode_free_provider(self):
-        oc = client.OpenCodeClient(command="fake-opencode")
-        completed = mock.Mock(
-            returncode=0,
-            stdout="opencode/free-b\nopencode/free-a\nopencode/free-a\n",
-        )
-        with mock.patch.object(client, "_run_opencode", return_value=completed) as run:
-            self.assertEqual(oc.list_models(), ["free-a", "free-b"])
+    def test_catalog_intersects_live_zero_cost_tool_models(self):
+        zen = {"data": [{"id": model} for model in ("free-a", "free-b", "paid")]}
+        catalog = {
+            "opencode": {
+                "models": {
+                    "free-a": {"tool_call": True, "cost": {"input": 0, "output": 0}},
+                    "free-b": {"tool_call": True, "cost": {"input": 0, "output": 0}},
+                    "paid": {"tool_call": True, "cost": {"input": 1, "output": 0}},
+                    "retired": {
+                        "tool_call": True,
+                        "status": "deprecated",
+                        "cost": {"input": 0, "output": 0},
+                    },
+                    "no-tools": {"tool_call": False, "cost": {"input": 0, "output": 0}},
+                }
+            }
+        }
+        responses = [
+            FakeResponse(body=json.dumps(zen).encode()),
+            FakeResponse(body=json.dumps(catalog).encode()),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "models.json"
+            with (
+                mock.patch.object(client, "_MODEL_SNAPSHOT", None),
+                mock.patch.object(client, "_model_cache_path", return_value=cache),
+                mock.patch.object(client, "_urlopen", side_effect=responses) as opened,
+            ):
+                oc = client.OpenCodeClient()
+                self.assertEqual(oc.list_models(), ["free-a", "free-b"])
+                self.assertEqual(oc.list_models(), ["free-a", "free-b"])
+                self.assertEqual(json.loads(cache.read_text()), ["free-a", "free-b"])
         self.assertEqual(
-            run.call_args.args[0],
-            ["fake-opencode", "models", "opencode", "--pure"],
+            [call.args[0].full_url for call in opened.call_args_list],
+            [client.ZEN_MODELS_URL, client.MODELS_DEV_URL],
         )
+        self.assertTrue(
+            all(
+                call.args[0].headers["User-agent"] == client.OPENCODE_USER_AGENT
+                for call in opened.call_args_list
+            )
+        )
+
+    def test_catalog_failure_uses_last_verified_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "models.json"
+            cache.write_text('["last-free"]')
+            with (
+                mock.patch.object(client, "_MODEL_SNAPSHOT", None),
+                mock.patch.object(client, "_model_cache_path", return_value=cache),
+                mock.patch.object(
+                    client, "_urlopen", side_effect=urllib.error.URLError("offline")
+                ),
+            ):
+                self.assertEqual(client.OpenCodeClient().list_models(), ["last-free"])
 
 
 if __name__ == "__main__":
