@@ -1,7 +1,7 @@
 manifest_version: 1
 name: oc-free-provider
 kind: model-provider
-version: 0.2.1
+version: 3.0.0
 requires_hermes: ">=0.21.3"
 description: Unofficial OpenCode Zen free-model transport with Hermes-local tools
 author: Hermes community
