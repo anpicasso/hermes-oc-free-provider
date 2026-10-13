@@ -140,14 +140,10 @@ COMPAT_TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
     "task": {
         "type": "object",
         "properties": {
-            "description": {"type": "string"},
-            "prompt": {"type": "string"},
-            "subagent_type": {"type": "string"},
-            "task_id": {"type": "string"},
-            "command": {"type": "string"},
-            "background": {"type": "boolean"},
+            "goal": {"type": "string"},
+            "context": {"type": "string"},
         },
-        "required": ["description", "prompt", "subagent_type"],
+        "required": ["goal"],
     },
     "todowrite": {
         "type": "object",
@@ -638,22 +634,13 @@ def _mapped_arguments(name: str, encoded: str) -> str:
     elif name == "skill":
         mapped = {"name": _required(arguments, name, "name")}
     elif name == "task":
-        context = [
-            str(_required(arguments, name, "description")),
-            f"Requested OpenCode subagent type: {_required(arguments, name, 'subagent_type')}",
-        ]
-        for key, label in (
-            ("task_id", "Previous task ID"),
-            ("command", "Requested command"),
-            ("background", "Requested background execution"),
-        ):
-            if key in arguments:
-                context.append(f"{label}: {arguments[key]}")
+        goal = _required(arguments, name, "goal")
+        context = str(arguments.get("context") or "")
         mapped = {
             "tasks": [
                 {
-                    "goal": _required(arguments, name, "prompt"),
-                    "context": "\n".join(context),
+                    "goal": goal,
+                    "context": context,
                 }
             ]
         }
@@ -737,31 +724,41 @@ def _opencode_arguments(name: str, encoded: str) -> str:
     elif name == "skill":
         mapped = {"name": _required(arguments, name, "name")}
     elif name == "task":
-        tasks = _required(arguments, name, "tasks")
-        if not isinstance(tasks, list) or not tasks or not isinstance(tasks[0], dict):
-            raise OpenCodeError("Hermes delegate history cannot be replayed as task.")
-        task = tasks[0]
-        context = str(task.get("context") or "")
-        lines = context.splitlines()
-        mapped = {
-            "description": lines[0] if lines else "Delegated Hermes task",
-            "prompt": _required(task, name, "goal"),
-            "subagent_type": "general",
-        }
-        prefixes = {
-            "Requested OpenCode subagent type: ": "subagent_type",
-            "Previous task ID: ": "task_id",
-            "Requested command: ": "command",
-            "Requested background execution: ": "background",
-        }
-        for line in lines[1:]:
-            for prefix, key in prefixes.items():
-                if line.startswith(prefix):
-                    value: Any = line.removeprefix(prefix)
-                    if key == "background":
-                        value = str(value).lower() == "true"
-                    mapped[key] = value
-                    break
+        if "goal" in arguments and "context" in arguments:
+            mapped = {
+                "tasks": [
+                    {
+                        "goal": _required(arguments, name, "goal"),
+                        "context": str(arguments.get("context") or ""),
+                    }
+                ]
+            }
+        else:
+            tasks = _required(arguments, name, "tasks")
+            if not isinstance(tasks, list) or not tasks or not isinstance(tasks[0], dict):
+                raise OpenCodeError("Hermes delegate history cannot be replayed as task.")
+            task = tasks[0]
+            context = str(task.get("context") or "")
+            lines = context.splitlines()
+            mapped = {
+                "description": lines[0] if lines else "Delegated Hermes task",
+                "prompt": _required(task, name, "goal"),
+                "subagent_type": "general",
+            }
+            prefixes = {
+                "Requested OpenCode subagent type: ": "subagent_type",
+                "Previous task ID: ": "task_id",
+                "Requested command: ": "command",
+                "Requested background execution: ": "background",
+            }
+            for line in lines[1:]:
+                for prefix, key in prefixes.items():
+                    if line.startswith(prefix):
+                        value: Any = line.removeprefix(prefix)
+                        if key == "background":
+                            value = str(value).lower() == "true"
+                        mapped[key] = value
+                        break
     elif name == "todowrite":
         todos = _required(arguments, name, "todos")
         if not isinstance(todos, list) or any(
