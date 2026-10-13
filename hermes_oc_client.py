@@ -27,7 +27,10 @@ ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
 MODELS_DEV_URL = "https://models.dev/api.json"
 LOGICAL_BASE_URL = DIRECT_URL
 OPENCODE_VERSION = "1.18.31"
-OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
+OPENCODE_UA_CHAT = f"opencode/{OPENCODE_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+OPENCODE_UA_RESPONSES = f"opencode/{OPENCODE_VERSION} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+OPENCODE_CLIENT_HEADER = "cli"
+OPENCODE_PROJECT_HEADER = "global"
 DEFAULT_MODEL = "big-pickle"
 FALLBACK_MODELS = (
     DEFAULT_MODEL,
@@ -205,8 +208,6 @@ COMPAT_TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
     },
 }
 _BASE62 = string.digits + string.ascii_letters
-_SESSION_LOCK = threading.Lock()
-_SESSION_COUNTER = 0
 _MODEL_SNAPSHOT: tuple[str, ...] | None = None
 _MODEL_SNAPSHOT_LOCK = threading.Lock()
 
@@ -238,7 +239,7 @@ def _urlopen(request: urllib.request.Request, timeout: float):
 def _json_get(url: str, timeout: float) -> Any:
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": OPENCODE_USER_AGENT},
+        headers={"Accept": "application/json", "User-Agent": OPENCODE_UA_CHAT},
     )
     with _urlopen(request, timeout) as response:
         return json.load(response)
@@ -325,16 +326,42 @@ def _models_for_process(timeout: float) -> tuple[str, ...]:
         return _MODEL_SNAPSHOT
 
 
+_LAST_ID_TS = 0
+_ID_COUNTER = 0
+_ID_LOCK = threading.Lock()
+
+
+def _oc_id(prefix: str, *, descending: bool) -> str:
+    """Exact replica of opencode's ID generator (packages/opencode/src/id/id.ts).
+
+    Sessions use descending IDs, requests use ascending. The Zen free tier
+    validates this format and rejects stale/fake IDs with 403.
+    """
+    global _LAST_ID_TS, _ID_COUNTER
+    with _ID_LOCK:
+        now_ts = int(time.time() * 1000)
+        if now_ts != _LAST_ID_TS:
+            _LAST_ID_TS = now_ts
+            _ID_COUNTER = 0
+        _ID_COUNTER += 1
+        value = (now_ts << 12) | _ID_COUNTER
+        if descending:
+            value = ~value & ((1 << 56) - 1)
+        time_bytes = value.to_bytes(7, "big")[-6:]
+        return (
+            prefix
+            + "_"
+            + time_bytes.hex()
+            + "".join(secrets.choice(_BASE62) for _ in range(14))
+        )
+
+
 def _session_id() -> str:
-    global _SESSION_COUNTER
-    with _SESSION_LOCK:
-        _SESSION_COUNTER = (_SESSION_COUNTER + 1) & 0xFFF
-        prefix = ((int(time.time() * 1000) << 12) | _SESSION_COUNTER) & ((1 << 48) - 1)
-    return (
-        "ses_"
-        + prefix.to_bytes(6, "big").hex()
-        + "".join(secrets.choice(_BASE62) for _ in range(14))
-    )
+    return _oc_id("ses", descending=True)
+
+
+def _request_id() -> str:
+    return _oc_id("msg", descending=False)
 
 
 def _compat_tool(name: str) -> dict[str, Any]:
@@ -1234,6 +1261,11 @@ class OpenCodeClient:
                 extra=extra,
             )
         wire_tools, mapped_tools = _wire_tools(tools)
+        # Zen free tier requires bash and read tools in the request
+        tool_names = {str((t.get("function") or {}).get("name") or "") for t in wire_tools}
+        for required in ("bash", "read"):
+            if required not in tool_names:
+                wire_tools.insert(0, _compat_tool(required))
         body: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -1274,8 +1306,11 @@ class OpenCodeClient:
                 "Authorization": "Bearer public",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "User-Agent": OPENCODE_USER_AGENT,
+                "User-Agent": OPENCODE_UA_CHAT,
                 "x-opencode-session": self._session,
+                "x-opencode-client": OPENCODE_CLIENT_HEADER,
+                "x-opencode-project": OPENCODE_PROJECT_HEADER,
+                "x-opencode-request": _request_id(),
             },
         )
 
@@ -1319,6 +1354,11 @@ class OpenCodeClient:
         extra: dict[str, Any],
     ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
         wire_tools, mapped_tools = _wire_tools(tools)
+        # Zen free tier requires bash and read tools in the request
+        tool_names = {str((t.get("function") or {}).get("name") or "") for t in wire_tools}
+        for required in ("bash", "read"):
+            if required not in tool_names:
+                wire_tools.insert(0, _compat_tool(required))
         input_items, instructions = _responses_input(messages, mapped_tools)
         body: dict[str, Any] = {
             "model": model,
@@ -1366,8 +1406,11 @@ class OpenCodeClient:
                 "Authorization": "Bearer public",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "User-Agent": OPENCODE_USER_AGENT,
+                "User-Agent": OPENCODE_UA_RESPONSES,
                 "x-opencode-session": self._session,
+                "x-opencode-client": OPENCODE_CLIENT_HEADER,
+                "x-opencode-project": OPENCODE_PROJECT_HEADER,
+                "x-opencode-request": _request_id(),
             },
         )
 

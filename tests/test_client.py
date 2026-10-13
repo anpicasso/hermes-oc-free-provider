@@ -799,7 +799,7 @@ class ClientTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                call.args[0].headers["User-agent"] == client.OPENCODE_USER_AGENT
+                call.args[0].headers["User-agent"] == client.OPENCODE_UA_CHAT
                 for call in opened.call_args_list
             )
         )
