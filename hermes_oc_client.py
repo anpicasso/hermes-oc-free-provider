@@ -843,15 +843,11 @@ def _opencode_arguments(name: str, encoded: str) -> str:
     elif name == "skill":
         mapped = {"name": _required(arguments, name, "name")}
     elif name == "task":
-        tasks = _required(arguments, name, "tasks")
-        if not isinstance(tasks, list) or not tasks or not isinstance(tasks[0], dict):
-            raise OpenCodeError("Hermes delegate history cannot be replayed as task.")
-        task = tasks[0]
-        context = str(task.get("context") or "")
-        lines = context.splitlines()
+        tasks = _delegate_history_tasks(arguments)
+        lines = str(tasks[0].get("context") or "").splitlines()
         mapped = {
             "description": lines[0] if lines else "Delegated Hermes task",
-            "prompt": _required(task, name, "goal"),
+            "prompt": _delegate_history_prompt(tasks),
             "subagent_type": "general",
         }
         prefixes = {
@@ -903,6 +899,49 @@ def _opencode_arguments(name: str, encoded: str) -> str:
     else:
         mapped = arguments
     return json.dumps(mapped, separators=(",", ":"))
+
+
+def _delegate_history_tasks(arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    if (tasks := arguments.get("tasks")) is None and (goal := arguments.get("goal")) is not None:
+        return [{"goal": goal, "context": arguments.get("context", "")}]
+    if isinstance(tasks, str):
+        try:
+            tasks = json.loads(tasks)
+        except json.JSONDecodeError:
+            tasks = None
+    tasks = [task for task in tasks if isinstance(task, dict)] if isinstance(tasks, list) else []
+    if tasks:
+        return tasks
+    return [
+        {
+            "goal": "",
+            "context": "\n".join(
+                f"{label}: {value}"
+                for key, label in (
+                    ("action", "Requested action"),
+                    ("subagent_id", "Previous task ID"),
+                    ("message", "Requested steering message"),
+                )
+                if (value := arguments.get(key)) not in (None, "")
+            ),
+        }
+    ]
+
+
+def _delegate_history_prompt(tasks: list[dict[str, Any]]) -> str:
+    lead = str(tasks[0].get("goal") or "Delegated Hermes task")
+    followups = [
+        "\n".join(
+            part
+            for part in (
+                f"Task {index}: {task.get('goal') or ''}".rstrip(),
+                str(task.get("context") or ""),
+            )
+            if part
+        )
+        for index, task in enumerate(tasks[1:], start=2)
+    ]
+    return "\n\n".join(part for part in (lead, *followups) if part)
 
 
 def _opencode_alias(name: str, arguments: str, mapped_tools: dict[str, str]) -> str:
