@@ -1068,7 +1068,16 @@ def _opencode_tool(
     alias = _opencode_alias(name, arguments, mapped_tools)
     if alias == name:
         return name, arguments or "{}"
-    return alias, _opencode_arguments(alias, arguments)
+    try:
+        return alias, _opencode_arguments(alias, arguments)
+    except OpenCodeError:
+        # Replay-only fallback. A recorded Hermes call the compatibility
+        # vocabulary cannot express (patch(mode="patch") V4A multi-file
+        # patches, unparsable arguments) is replayed under its native name
+        # with its original arguments instead of poisoning the conversation.
+        # The call already ran in Hermes; live model calls stay fail-closed in
+        # _translate_tool.
+        return name, arguments or "{}"
 
 
 def _wire_messages(

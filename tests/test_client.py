@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT))
 import hermes_oc_client as client  # type: ignore[import-not-found]
 
 
+# Local synthetic transport: FakeResponse and mocked _urlopen keep every test
+# in this file offline; nothing here performs live inference.
 class FakeResponse:
     def __init__(self, lines=(), body=b"{}"):
         self._lines = [
@@ -851,6 +853,31 @@ class ClientTests(unittest.TestCase):
             with self.assertRaisesRegex(client.OpenCodeError, "client is closed"):
                 _ = result.choices
         open_request.assert_not_called()
+
+    def test_unmappable_patch_history_replays_natively(self):
+        arguments = json.dumps(
+            {
+                "mode": "patch",
+                "patch": "*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch",
+            }
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_v4a",
+                        "type": "function",
+                        "function": {"name": "patch", "arguments": arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_v4a", "content": "Success."},
+        ]
+        wire = client._wire_messages(messages, {"edit": "patch"})
+        self.assertEqual(wire[0]["tool_calls"][0]["function"]["name"], "patch")
+        self.assertEqual(wire[0]["tool_calls"][0]["function"]["arguments"], arguments)
+        self.assertEqual(wire[1], messages[1])
 
     def test_catalog_intersects_live_zero_cost_tool_models(self):
         zen = {"data": [{"id": model} for model in ("free-a", "free-b", "paid")]}
