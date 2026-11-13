@@ -7,9 +7,14 @@ agent loop and every tool execution in Hermes.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import os
 import secrets
+import shutil
 import string
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -27,8 +32,8 @@ RESPONSES_URL = f"{API_BASE_URL}/responses"
 ZEN_MODELS_URL = "https://opencode.ai/inference/v1/models"
 MODELS_DEV_URL = "https://models.dev/api.json"
 LOGICAL_BASE_URL = API_BASE_URL
-OPENCODE_VERSION = "1.18.31"
-OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
+OPENCODE_VERSION = "2.0.10"
+OPENCODE_USER_AGENT = f"opencode/latest/{OPENCODE_VERSION}/cli"
 DEFAULT_MODEL = "big-pickle"
 # Verified against the live /inference/v1/models catalog intersected with
 # models.dev zero-cost, tool-capable, non-deprecated entries on 2026-11-13.
@@ -240,6 +245,111 @@ def _urlopen(request: urllib.request.Request, timeout: float):
     return _OPENER.open(request, timeout=timeout)
 
 
+_TRANSPORT_JS = Path(__file__).with_name("oc_transport.js")
+
+
+def _bun_binary() -> str | None:
+    """Bun, wherever it was installed. The free tier rejects every other TLS stack."""
+    candidates = [os.environ.get("OC_FREE_BUN", "")]
+    candidates.append(shutil.which("bun") or "")
+    candidates.append(str(Path.home() / ".bun" / "bin" / "bun"))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+class _BunStream:
+    """urllib-response lookalike over the Bun transport's stdout."""
+
+    def __init__(self, process: subprocess.Popen, timer: threading.Timer):
+        self._process = process
+        self._timer = timer
+
+    def __enter__(self) -> "_BunStream":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def __iter__(self) -> Iterator[bytes]:
+        stdout = self._process.stdout
+        if stdout is None:
+            return
+        yield from stdout
+
+    def read(self) -> bytes:
+        stdout = self._process.stdout
+        return stdout.read() if stdout is not None else b""
+
+    def close(self) -> None:
+        self._timer.cancel()
+        if self._process.poll() is None:
+            self._process.kill()
+        if self._process.stdout is not None:
+            self._process.stdout.close()
+        self._process.wait()
+
+
+def _bun_open(request: urllib.request.Request, timeout: float, bun: str):
+    data = request.data if isinstance(request.data, (bytes, bytearray)) else b""
+    payload = json.dumps(
+        {
+            "url": request.full_url,
+            "headers": {key.lower(): value for key, value in request.header_items()},
+            "body": bytes(data).decode("utf-8", "replace"),
+        }
+    ).encode()
+    process = subprocess.Popen(
+        [bun, str(_TRANSPORT_JS)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(payload)
+        process.stdin.close()
+        header = process.stdout.readline()
+        try:
+            status = int(json.loads(header or b"{}").get("status") or 0)
+        except ValueError:
+            status = 0
+        if status <= 0:
+            body = process.stdout.read().decode("utf-8", "replace")
+            raise OpenCodeError(f"OpenCode transport failed: {body[:500] or 'no status'}")
+        if status >= 400:
+            body = process.stdout.read().decode("utf-8", "replace")
+            process.wait()
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                body[:200],
+                {},  # type: ignore[arg-type]
+                io.BytesIO(body.encode()),
+            )
+        timer = threading.Timer(timeout, process.kill)
+        timer.daemon = True
+        timer.start()
+        return _BunStream(process, timer)
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        raise
+
+
+def _open_stream(request: urllib.request.Request, timeout: float):
+    """POST through Bun. The free tier answers every other TLS stack with 429."""
+    bun = _bun_binary()
+    if bun:
+        return _bun_open(request, timeout, bun)
+    raise OpenCodeError(
+        "OpenCode's free tier requires Bun as the HTTP transport. "
+        "Install it with 'curl -fsSL https://bun.sh/install | bash' "
+        "or point OC_FREE_BUN at the binary."
+    )
+
+
 def _json_get(url: str, timeout: float) -> Any:
     request = urllib.request.Request(
         url,
@@ -331,14 +441,31 @@ def _models_for_process(timeout: float) -> tuple[str, ...]:
 
 
 def _session_id() -> str:
+    """OpenCode's Identifier.descending(): inverted (ts << 12 | counter), 12 hex + 14 base62."""
     global _SESSION_COUNTER
     with _SESSION_LOCK:
-        _SESSION_COUNTER = (_SESSION_COUNTER + 1) & 0xFFF
-        prefix = ((int(time.time() * 1000) << 12) | _SESSION_COUNTER) & ((1 << 48) - 1)
+        _SESSION_COUNTER += 1
+        current = (int(time.time() * 1000) << 12) | _SESSION_COUNTER
+        value = ~current & ((1 << 48) - 1)
     return (
         "ses_"
-        + prefix.to_bytes(6, "big").hex()
+        + value.to_bytes(6, "big").hex()
         + "".join(secrets.choice(_BASE62) for _ in range(14))
+    )
+
+
+def _env_block(session: str) -> str:
+    """The environment preamble the gateway requires on every free-tier request."""
+    root = os.getcwd()
+    repo = "yes" if os.path.isdir(os.path.join(root, ".git")) else "no"
+    return (
+        "<env>\n"
+        f"  Current conversation session ID: {session}\n"
+        f"  Working directory: {root}\n"
+        f"  Workspace root folder: {root}\n"
+        f"  Is directory a git repo: {repo}\n"
+        f"  Platform: {sys.platform}\n"
+        "</env>"
     )
 
 
@@ -455,8 +582,9 @@ def _responses_content(content: Any, *, output: bool = False) -> list[dict[str, 
 def _responses_input(
     messages: list[dict[str, Any]],
     mapped_tools: dict[str, str],
+    session: str,
 ) -> tuple[list[dict[str, Any]], str]:
-    instructions = ["You are opencode"]
+    instructions = [_env_block(session)]
     items: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role") or "user")
@@ -1242,7 +1370,7 @@ class OpenCodeClient:
         body: dict[str, Any] = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "You are opencode"},
+                {"role": "system", "content": _env_block(self._session)},
                 *_wire_messages(messages, mapped_tools),
             ],
             "tools": wire_tools,
@@ -1286,7 +1414,7 @@ class OpenCodeClient:
 
         def events() -> Iterator[dict[str, Any]]:
             try:
-                response = _urlopen(request, timeout)
+                response = _open_stream(request, timeout)
             except urllib.error.HTTPError as exc:
                 body_text = exc.read().decode("utf-8", "replace")
                 raise _status_error(
@@ -1324,7 +1452,7 @@ class OpenCodeClient:
         extra: dict[str, Any],
     ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
         wire_tools, mapped_tools = _wire_tools(tools)
-        input_items, instructions = _responses_input(messages, mapped_tools)
+        input_items, instructions = _responses_input(messages, mapped_tools, self._session)
         body: dict[str, Any] = {
             "model": model,
             "input": input_items,
@@ -1378,7 +1506,7 @@ class OpenCodeClient:
 
         def source() -> Iterator[dict[str, Any]]:
             try:
-                response = _urlopen(request, timeout)
+                response = _open_stream(request, timeout)
             except urllib.error.HTTPError as exc:
                 body_text = exc.read().decode("utf-8", "replace")
                 raise _status_error(

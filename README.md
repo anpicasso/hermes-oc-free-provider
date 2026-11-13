@@ -22,14 +22,17 @@ any time.
 
 As of November 2026 the upstream contract explicitly excludes this transport:
 OpenCode's Console documentation states that free-tier chat models are only
-available from within OpenCode, and that other harnesses — Hermes included —
-receive HTTP 403 for those models, even with a Console API key. Live probes from
-this repository return HTTP 429 with `FreeUsageLimitError` instead; the request's
-historical anonymous sentinel and OpenCode User-Agent do not change that. The
-plugin reports the upstream error verbatim and adds no identity or authorization
-workaround. Free-model inference therefore fails until OpenCode changes that
-policy; paid and Go models are served by Hermes' built-in `opencode-zen` and
-`opencode-go` providers, which are the supported path.
+available from within OpenCode, and the gateway enforces that by answering
+anything that does not look like the OpenCode client with HTTP 429
+`FreeUsageLimitError`. The check is not a quota, a key, or a header set: it is
+the request's client identity, down to the TLS stack.
+
+This plugin gets around that check by reproducing the official client's request
+— its sortable session id, its `<env>` system preamble, its `stream: true` tool
+call shape, and its Bun TLS stack. That is deliberate client impersonation. It
+is not a documented integration, it may stop working without notice, and whoever
+runs it does so on their own judgement and responsibility. The supported paths
+remain Hermes' built-in `opencode-zen` and `opencode-go` providers.
 
 Before using the plugin, review and independently comply with the current:
 
@@ -100,8 +103,21 @@ hermes plugins install oc-free-provider --enable
 ```
 
 The plugin does not install or run the OpenCode CLI, Node.js, npm, or `npx`.
-Model discovery and inference use Python's standard-library HTTPS client, so the
-same code path works on Linux, macOS, and Windows.
+
+**It does need [Bun](https://bun.sh).** Since OpenCode's October 2026 gateway
+change, anonymous free-tier requests are only answered when they leave from
+Bun's TLS stack: the same headers and body from Python, curl, Node, or even
+curl-impersonate get `429 FreeUsageLimitError`. Inference is therefore posted
+through `oc_transport.js` (`bun oc_transport.js`); model discovery still uses
+Python's standard-library HTTPS client. Install Bun once:
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+```
+
+The plugin finds `bun` on `PATH`, or at `~/.bun/bin/bun`, and `OC_FREE_BUN`
+overrides both. Without Bun every request fails immediately with that
+instruction instead of a misleading 429.
 
 Select the provider and one of its discovered models:
 
@@ -109,6 +125,23 @@ Select the provider and one of its discovered models:
 hermes model
 # Provider: opencode-free
 ```
+
+## What the gateway now requires
+
+Each free-tier request carries the identity the gateway checks for:
+
+- `ses_` session id in OpenCode's *descending* sortable form (12 hex chars of an
+  inverted millisecond timestamp, then 14 base62), sent as `x-opencode-session`
+  and repeated in the prompt;
+- a system message containing OpenCode's `<env>` block with
+  `Current conversation session ID`, `Working directory`, and
+  `Workspace root folder`;
+- `stream: true` and a non-empty tool list;
+- `User-Agent: opencode/latest/<version>/cli` and `Authorization: Bearer public`;
+- the Bun transport described above.
+
+The endpoint is `https://opencode.ai/inference/openai/v1`; the older
+`/zen/v1` paths no longer serve free models.
 
 ## Model discovery
 
@@ -133,6 +166,7 @@ and the underlying provider and can change independently of this repository.
 ```bash
 python -m unittest discover -s tests -v
 hermes plugins validate . --json
+python -c "import hermes_oc_client as c; print(c.OpenCodeClient().chat.completions.create(model='big-pickle', messages=[{'role':'user','content':'say PONG'}], tools=[{'type':'function','function':{'name':'read_file','parameters':{'type':'object','properties':{}}}}]).choices[0].message.content)"
 ```
 
 `hermes plugins doctor .` also verifies runtime discovery, import, and provider

@@ -59,6 +59,13 @@ class ClientTests(unittest.TestCase):
     def test_session_id_matches_opencode_shape(self):
         self.assertRegex(client._session_id(), r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 
+    def test_session_id_is_a_descending_sortable_id(self):
+        # The gateway rejects ids whose 12 hex chars are an ascending timestamp:
+        # OpenCode inverts (~) them, so the prefix starts high.
+        session = client._session_id()
+        self.assertGreaterEqual(int(session[4:6], 16), 0xC0)
+        self.assertIn(session, client._env_block(session))
+
     def test_direct_request_preserves_hermes_tools_and_returns_native_call(self):
         captured = {}
 
@@ -110,7 +117,7 @@ class ClientTests(unittest.TestCase):
                 },
             },
         }
-        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
             result = oc.chat.completions.create(
                 model="m",
                 messages=[{"role": "user", "content": "probe"}],
@@ -125,9 +132,11 @@ class ClientTests(unittest.TestCase):
             names[: len(client.COMPAT_TOOL_NAMES)], list(client.COMPAT_TOOL_NAMES)
         )
         self.assertIn("hermes_probe", names)
-        self.assertEqual(
-            body["messages"][0], {"role": "system", "content": "You are opencode"}
-        )
+        env = body["messages"][0]
+        self.assertEqual(env["role"], "system")
+        self.assertIn("<env>", env["content"])
+        self.assertIn("Current conversation session ID: ses_", env["content"])
+        self.assertIn("Working directory: ", env["content"])
         self.assertEqual(call.function.name, "hermes_probe")
         self.assertEqual(json.loads(call.function.arguments), {"value": "PING"})
         self.assertEqual(result.usage.total_tokens, 6)
@@ -188,7 +197,7 @@ class ClientTests(unittest.TestCase):
             "type": "function",
             "function": {"name": "hermes_probe", "parameters": {"type": "object"}},
         }
-        with mock.patch.object(client, "_urlopen", return_value=response):
+        with mock.patch.object(client, "_open_stream", return_value=response):
             result = oc.chat.completions.create(model="m", messages=[], tools=[tool])
             call = result.choices[0].message.tool_calls[0]
         self.assertEqual(call.id, "call_1")
@@ -358,7 +367,7 @@ class ClientTests(unittest.TestCase):
             },
         ]
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
             result = oc.chat.completions.create(
                 model="m",
                 messages=messages,
@@ -381,7 +390,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(body["messages"][2], messages[1])
 
         mapped = {"bash": "terminal"}
-        response_input, _ = client._responses_input(messages, mapped)
+        response_input, _ = client._responses_input(messages, mapped, "ses_test")
         self.assertIn(
             {
                 "type": "function_call",
@@ -445,7 +454,7 @@ class ClientTests(unittest.TestCase):
             },
         )
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", return_value=response):
+        with mock.patch.object(client, "_open_stream", return_value=response):
             chunks = list(
                 oc.chat.completions.create(
                     model="m", messages=[], tools=[tool("terminal")], stream=True
@@ -478,7 +487,7 @@ class ClientTests(unittest.TestCase):
             )
 
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
             stream = oc.chat.completions.create(model="m", messages=[], stream=True)
             with self.assertRaisesRegex(client.OpenCodeError, "inference error"):
                 list(stream)
@@ -529,7 +538,7 @@ class ClientTests(unittest.TestCase):
             },
         ]
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
             result = oc.chat.completions.create(model="m", messages=messages, tools=[])
             self.assertEqual(result.choices[0].message.content, "TOOL_OK")
         self.assertEqual(captured["body"]["messages"][2], messages[1])
@@ -616,7 +625,7 @@ class ClientTests(unittest.TestCase):
         oc = client.OpenCodeClient()
         with (
             mock.patch.object(client, "RESPONSES_MODELS", {"free-responses-probe"}),
-            mock.patch.object(client, "_urlopen", side_effect=fake_open),
+            mock.patch.object(client, "_open_stream", side_effect=fake_open),
         ):
             first = oc.chat.completions.create(
                 model="free-responses-probe",
@@ -692,7 +701,7 @@ class ClientTests(unittest.TestCase):
                 ],
             }
         )
-        with mock.patch.object(client, "_urlopen", return_value=response):
+        with mock.patch.object(client, "_open_stream", return_value=response):
             result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaisesRegex(
                 client.OpenCodeError, "compatibility-only tool 'bash'"
@@ -708,7 +717,7 @@ class ClientTests(unittest.TestCase):
             client.DIRECT_URL, 429, "rate", {}, io.BytesIO(body)
         )
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", side_effect=error):
+        with mock.patch.object(client, "_open_stream", side_effect=error):
             result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaises(client.OpenCodeError) as caught:
                 _ = result.choices
@@ -717,7 +726,7 @@ class ClientTests(unittest.TestCase):
 
     def test_empty_and_content_filtered_responses_fail_explicitly(self):
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", return_value=sse()):
+        with mock.patch.object(client, "_open_stream", return_value=sse()):
             with self.assertRaisesRegex(client.OpenCodeError, "no events"):
                 _ = oc.chat.completions.create(model="m", messages=[]).choices
         filtered = sse(
@@ -726,7 +735,7 @@ class ClientTests(unittest.TestCase):
                 "choices": [{"delta": {}, "finish_reason": "content_filter"}],
             }
         )
-        with mock.patch.object(client, "_urlopen", return_value=filtered):
+        with mock.patch.object(client, "_open_stream", return_value=filtered):
             with self.assertRaisesRegex(client.OpenCodeError, "content filter"):
                 _ = oc.chat.completions.create(model="m", messages=[]).choices
 
@@ -750,7 +759,7 @@ class ClientTests(unittest.TestCase):
             chunks = [chunk async for chunk in stream]
             self.assertEqual(chunks[0].choices[0].delta.content, "OK")
 
-        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
             asyncio.run(run())
 
     def test_redirects_are_disabled(self):
@@ -763,7 +772,7 @@ class ClientTests(unittest.TestCase):
     def test_closed_client_fails_before_network(self):
         oc = client.OpenCodeClient()
         oc.close()
-        with mock.patch.object(client, "_urlopen") as open_request:
+        with mock.patch.object(client, "_open_stream") as open_request:
             result = oc.chat.completions.create(model="m", messages=[])
             with self.assertRaisesRegex(client.OpenCodeError, "client is closed"):
                 _ = result.choices
