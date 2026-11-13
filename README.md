@@ -20,6 +20,17 @@ case. This plugin's current public compatibility transport is not documented by
 OpenCode as a supported Hermes integration and may be changed or disabled at
 any time.
 
+As of November 2026 the upstream contract explicitly excludes this transport:
+OpenCode's Console documentation states that free-tier chat models are only
+available from within OpenCode, and that other harnesses — Hermes included —
+receive HTTP 403 for those models, even with a Console API key. Live probes from
+this repository return HTTP 429 with `FreeUsageLimitError` instead; the request's
+historical anonymous sentinel and OpenCode User-Agent do not change that. The
+plugin reports the upstream error verbatim and adds no identity or authorization
+workaround. Free-model inference therefore fails until OpenCode changes that
+policy; paid and Go models are served by Hermes' built-in `opencode-zen` and
+`opencode-go` providers, which are the supported path.
+
 Before using the plugin, review and independently comply with the current:
 
 - [OpenCode Terms of Service](https://opencode.ai/legal/terms-of-service)
@@ -108,8 +119,11 @@ are all zero. The resulting intersection—not the full upstream responses—is
 cached for the gateway process and persisted under the active Hermes profile.
 Each new gateway process queries both endpoints once; if refresh fails or finds
 no qualifying model, the plugin uses the last successful intersection, then
-the verified entries bundled with it when no cache exists. It selects
-`/chat/completions` or `/responses` according to the known model transport.
+the verified entries bundled with it when no cache exists. Requests use the
+Console API base advertised by models.dev
+(`https://opencode.ai/inference/openai/v1`). The current free catalog is served
+over `/chat/completions`; `RESPONSES_MODELS` selects the Responses adapter for
+any model that requires it.
 
 Model availability, pricing, retention, and data-use rules belong to OpenCode
 and the underlying provider and can change independently of this repository.

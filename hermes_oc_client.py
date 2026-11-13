@@ -21,29 +21,34 @@ from typing import Any
 
 from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
 
-DIRECT_URL = "https://opencode.ai/zen/v1/chat/completions"
-RESPONSES_URL = "https://opencode.ai/zen/v1/responses"
-ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+API_BASE_URL = "https://opencode.ai/inference/openai/v1"
+DIRECT_URL = f"{API_BASE_URL}/chat/completions"
+RESPONSES_URL = f"{API_BASE_URL}/responses"
+ZEN_MODELS_URL = "https://opencode.ai/inference/v1/models"
 MODELS_DEV_URL = "https://models.dev/api.json"
-LOGICAL_BASE_URL = DIRECT_URL
+LOGICAL_BASE_URL = API_BASE_URL
 OPENCODE_VERSION = "1.18.31"
 OPENCODE_USER_AGENT = f"opencode/{OPENCODE_VERSION}"
 DEFAULT_MODEL = "big-pickle"
+# Verified against the live /inference/v1/models catalog intersected with
+# models.dev zero-cost, tool-capable, non-deprecated entries on 2026-11-13.
 FALLBACK_MODELS = (
     DEFAULT_MODEL,
-    "ling-3.0-flash-fin-free",
-    "mimo-v2.5-free",
-    "muse-spark-1.2-contributor-free",
-    "muse-spark-1.3-contributor-free",
-    "nemotron-3-ultra-free",
+    "beam-free",
+    "deepseek-v4.1-flash-free",
+    "flint-40b-free",
+    "glm-5.3-flash-free",
+    "iceman-free",
+    "inkling-2-small-free",
+    "longcat-2.5-free",
+    "mimo-v2.6-flash-free",
+    "minimax-m3.1-flash-free",
     "nemotron-3.5-lightning-free",
+    "nemotron-3.5-super-vl-free",
 )
-RESPONSES_MODELS = frozenset(
-    {
-        "muse-spark-1.2-contributor-free",
-        "muse-spark-1.3-contributor-free",
-    }
-)
+# The current free catalog is served over Chat Completions; the previous
+# contributor-free Responses ids no longer exist upstream.
+RESPONSES_MODELS = frozenset()
 COMPAT_TOOL_NAMES = (
     "bash",
     "edit",

@@ -547,7 +547,7 @@ class ClientTests(unittest.TestCase):
             {
                 "type": "response.created",
                 "response": {
-                    "model": "muse-spark-1.3-contributor-free",
+                    "model": "free-responses-probe",
                     "status": "in_progress",
                 },
             },
@@ -571,7 +571,7 @@ class ClientTests(unittest.TestCase):
             {
                 "type": "response.completed",
                 "response": {
-                    "model": "muse-spark-1.3-contributor-free",
+                    "model": "free-responses-probe",
                     "status": "completed",
                     "usage": {
                         "input_tokens": 10,
@@ -585,12 +585,12 @@ class ClientTests(unittest.TestCase):
             {
                 "type": "response.output_text.delta",
                 "delta": "TOOL_OK",
-                "response": {"model": "muse-spark-1.3-contributor-free"},
+                "response": {"model": "free-responses-probe"},
             },
             {
                 "type": "response.completed",
                 "response": {
-                    "model": "muse-spark-1.3-contributor-free",
+                    "model": "free-responses-probe",
                     "status": "completed",
                     "usage": {
                         "input_tokens": 14,
@@ -614,9 +614,12 @@ class ClientTests(unittest.TestCase):
             },
         }
         oc = client.OpenCodeClient()
-        with mock.patch.object(client, "_urlopen", side_effect=fake_open):
+        with (
+            mock.patch.object(client, "RESPONSES_MODELS", {"free-responses-probe"}),
+            mock.patch.object(client, "_urlopen", side_effect=fake_open),
+        ):
             first = oc.chat.completions.create(
-                model="muse-spark-1.3-contributor-free",
+                model="free-responses-probe",
                 messages=[{"role": "user", "content": "probe"}],
                 tools=[tool],
             )
@@ -645,7 +648,7 @@ class ClientTests(unittest.TestCase):
                 },
             ]
             second = oc.chat.completions.create(
-                model="muse-spark-1.3-contributor-free",
+                model="free-responses-probe",
                 messages=messages,
                 tools=[tool],
             )
@@ -697,8 +700,12 @@ class ClientTests(unittest.TestCase):
                 _ = result.choices
 
     def test_http_error_exposes_status_code(self):
+        body = (
+            b'{"type":"error","error":{"type":"FreeUsageLimitError",'
+            b'"message":"Free usage limit reached."}}'
+        )
         error = urllib.error.HTTPError(  # type: ignore[arg-type]
-            client.DIRECT_URL, 429, "rate", {}, io.BytesIO(b"busy")
+            client.DIRECT_URL, 429, "rate", {}, io.BytesIO(body)
         )
         oc = client.OpenCodeClient()
         with mock.patch.object(client, "_urlopen", side_effect=error):
@@ -706,6 +713,7 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(client.OpenCodeError) as caught:
                 _ = result.choices
         self.assertEqual(caught.exception.status_code, 429)
+        self.assertIn("FreeUsageLimitError", str(caught.exception))
 
     def test_empty_and_content_filtered_responses_fail_explicitly(self):
         oc = client.OpenCodeClient()
