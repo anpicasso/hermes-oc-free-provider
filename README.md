@@ -145,18 +145,28 @@ The endpoint is `https://opencode.ai/inference/openai/v1`; the older
 
 ## Model discovery
 
-The plugin intersects OpenCode Zen's live `/v1/models` response with the
-OpenCode catalog metadata published by [models.dev](https://models.dev/). It
-exposes only live, tool-capable models whose published input/output/cache costs
-are all zero. The resulting intersection—not the full upstream responses—is
-cached for the gateway process and persisted under the active Hermes profile.
-Each new gateway process queries both endpoints once; if refresh fails or finds
-no qualifying model, the plugin uses the last successful intersection, then
-the verified entries bundled with it when no cache exists. Requests use the
-Console API base advertised by models.dev
-(`https://opencode.ai/inference/openai/v1`). The current free catalog is served
-over `/chat/completions`; `RESPONSES_MODELS` selects the Responses adapter for
-any model that requires it.
+OpenCode's live `/inference/v1/models` response is the authoritative catalog:
+every advertised model whose id ends in `-free` is exposed, even when
+[models.dev](https://models.dev/) has not published it yet. models.dev metadata
+is consulted when available to exclude deprecated models, drop models without
+tool calling, and include zero-cost models that do not carry the `-free` suffix
+(such as `big-pickle`). Ids the relay still lists but no longer serves are
+excluded explicitly. The current free catalog is served over
+`/chat/completions`.
+
+The catalog is re-read while the process runs: the relay's list is refreshed at
+most every 10 minutes, models.dev metadata every 6 hours (it is a
+multi-megabyte payload). A gateway process that lived for days would otherwise
+keep serving the catalog it read at start-up. The discovered list is persisted
+under the active Hermes profile and used when a refresh fails; that persisted
+copy is dropped after a week. The bundled list is the last resort, used before
+the first successful discovery or while the relay is unreachable.
+
+Hermes shows a provider's curated floor (`fallback_models`) merged with its
+live list, so the plugin pins the floor to the last discovered catalog: a
+static floor would keep retired ids in the picker and hide newly launched free
+models. The picker therefore lists exactly the free ids the relay currently
+serves.
 
 Model availability, pricing, retention, and data-use rules belong to OpenCode
 and the underlying provider and can change independently of this repository.

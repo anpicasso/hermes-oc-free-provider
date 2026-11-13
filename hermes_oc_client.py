@@ -35,6 +35,16 @@ LOGICAL_BASE_URL = API_BASE_URL
 OPENCODE_VERSION = "2.0.10"
 OPENCODE_USER_AGENT = f"opencode/latest/{OPENCODE_VERSION}/cli"
 DEFAULT_MODEL = "big-pickle"
+# The relay's catalog changes on release timescales. The in-process snapshot is
+# refreshed once it is older than this, so a long-lived gateway never keeps
+# serving the catalog it read at start-up.
+MODEL_SNAPSHOT_TTL = 600.0
+# models.dev is a multi-megabyte payload: refresh its metadata far less often
+# than the relay's own catalog.
+METADATA_SNAPSHOT_TTL = 6 * 3600.0
+# The persisted catalog is the offline fallback. Keep it only while it still
+# describes the relay's current free tier.
+MODEL_CACHE_MAX_AGE = 7 * 24 * 3600.0
 # Verified against the live /inference/v1/models catalog intersected with
 # models.dev zero-cost, tool-capable, non-deprecated entries on 2026-11-13.
 FALLBACK_MODELS = (
@@ -50,6 +60,15 @@ FALLBACK_MODELS = (
     "minimax-m3.1-flash-free",
     "nemotron-3.5-lightning-free",
     "nemotron-3.5-super-vl-free",
+)
+# Models the relay still lists but no longer serves (or that are not models at
+# all). Keep in sync with Hermes' opencode-free exclusion list.
+EXCLUDED_MODELS = frozenset(
+    {
+        "test",
+        "ox-alpha-free",
+        "deepseek-v4-flash-free",
+    }
 )
 # The current free catalog is served over Chat Completions; the previous
 # contributor-free Responses ids no longer exist upstream.
@@ -218,7 +237,11 @@ _BASE62 = string.digits + string.ascii_letters
 _SESSION_LOCK = threading.Lock()
 _SESSION_COUNTER = 0
 _MODEL_SNAPSHOT: tuple[str, ...] | None = None
+_MODEL_SNAPSHOT_AT = 0.0
 _MODEL_SNAPSHOT_LOCK = threading.Lock()
+_METADATA_SNAPSHOT: dict[str, Any] | None = None
+_METADATA_SNAPSHOT_AT = 0.0
+_METADATA_SNAPSHOT_LOCK = threading.Lock()
 
 
 class OpenCodeError(RuntimeError):
@@ -360,6 +383,14 @@ def _json_get(url: str, timeout: float) -> Any:
 
 
 def _free_live_models(zen: Any, catalog: Any) -> list[str]:
+    """Free models advertised by the Zen relay that support tool calling.
+
+    The relay's own ``/v1/models`` response is authoritative for availability.
+    A ``-free`` suffix is enough to qualify, so newly launched free models show
+    up even before models.dev catches up. models.dev metadata is consulted when
+    present: it excludes deprecated models, requires zero cost for ids without
+    the suffix (e.g. ``big-pickle``), and drops non-tool models.
+    """
     zen_models = {
         str(item.get("id") or "")
         for item in (zen.get("data") if isinstance(zen, dict) else []) or []
@@ -368,17 +399,29 @@ def _free_live_models(zen: Any, catalog: Any) -> list[str]:
     provider = catalog.get("opencode") if isinstance(catalog, dict) else None
     metadata = provider.get("models") if isinstance(provider, dict) else None
     if not isinstance(metadata, dict):
-        return []
+        metadata = {}
 
     free = []
-    for model, details in metadata.items():
-        if not isinstance(details, dict) or details.get("status") == "deprecated":
+    for model in sorted(zen_models):
+        lowered = model.lower()
+        if not lowered or lowered in EXCLUDED_MODELS:
+            continue
+        details = metadata.get(model)
+        if not isinstance(details, dict):
+            # No models.dev entry (yet): trust the relay's free-tier naming.
+            if lowered.endswith("-free"):
+                free.append(model)
+            continue
+        if details.get("status") == "deprecated":
+            continue
+        if details.get("tool_call") is not True:
+            continue
+        if lowered.endswith("-free"):
+            free.append(model)
             continue
         costs = details.get("cost")
         if (
-            model in zen_models
-            and details.get("tool_call") is True
-            and isinstance(costs, dict)
+            isinstance(costs, dict)
             and costs
             and all(
                 isinstance(cost, (int, float))
@@ -387,8 +430,8 @@ def _free_live_models(zen: Any, catalog: Any) -> list[str]:
                 for cost in costs.values()
             )
         ):
-            free.append(str(model))
-    return sorted(free)
+            free.append(model)
+    return free
 
 
 def _model_cache_path() -> Path:
@@ -396,8 +439,11 @@ def _model_cache_path() -> Path:
 
 
 def _load_model_cache() -> list[str]:
+    path = _model_cache_path()
     try:
-        models = json.loads(_model_cache_path().read_text(encoding="utf-8"))
+        if time.time() - path.stat().st_mtime > MODEL_CACHE_MAX_AGE:
+            return []
+        models = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     if not isinstance(models, list) or any(
@@ -421,23 +467,82 @@ def _save_model_cache(models: list[str]) -> None:
             pass
 
 
-def _models_for_process(timeout: float) -> tuple[str, ...]:
-    global _MODEL_SNAPSHOT
-    with _MODEL_SNAPSHOT_LOCK:
-        if _MODEL_SNAPSHOT is None:
+def _models_dev_metadata(timeout: float) -> dict[str, Any]:
+    """models.dev metadata, refreshed rarely (multi-megabyte payload).
+
+    A failed refresh keeps the last good copy: the relay's own catalog is
+    authoritative for availability, models.dev only refines it.
+    """
+    global _METADATA_SNAPSHOT, _METADATA_SNAPSHOT_AT
+    with _METADATA_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        if (
+            _METADATA_SNAPSHOT is None
+            or now - _METADATA_SNAPSHOT_AT >= METADATA_SNAPSHOT_TTL
+        ):
             try:
-                models = _free_live_models(
-                    _json_get(ZEN_MODELS_URL, timeout),
-                    _json_get(MODELS_DEV_URL, timeout),
-                )
+                catalog = _json_get(MODELS_DEV_URL, max(timeout, 30.0))
             except (OSError, ValueError, urllib.error.URLError):
-                models = []
-            if models:
-                _save_model_cache(models)
-            else:
-                models = _load_model_cache() or list(FALLBACK_MODELS)
-            _MODEL_SNAPSHOT = tuple(models)
+                catalog = None
+            if isinstance(catalog, dict):
+                _METADATA_SNAPSHOT = catalog
+                _METADATA_SNAPSHOT_AT = now
+            elif _METADATA_SNAPSHOT is None:
+                _METADATA_SNAPSHOT = {}
+                _METADATA_SNAPSHOT_AT = now
+        return _METADATA_SNAPSHOT or {}
+
+
+def _discover_models(timeout: float) -> list[str]:
+    """Live free-model catalog: the relay first, models.dev as the refinement."""
+    try:
+        models = _free_live_models(
+            _json_get(ZEN_MODELS_URL, timeout),
+            _models_dev_metadata(timeout),
+        )
+    except (OSError, ValueError, urllib.error.URLError):
+        models = []
+    if models:
+        _save_model_cache(models)
+        return models
+    return _load_model_cache() or list(FALLBACK_MODELS)
+
+
+def _models_for_process(timeout: float) -> tuple[str, ...]:
+    """Catalog for this process, refreshed once the snapshot goes stale.
+
+    A gateway process lives for days; a snapshot taken at start-up would keep
+    the picker on a catalog the relay retired hours ago.
+    """
+    global _MODEL_SNAPSHOT, _MODEL_SNAPSHOT_AT
+    with _MODEL_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        if (
+            _MODEL_SNAPSHOT is None
+            or now - _MODEL_SNAPSHOT_AT >= MODEL_SNAPSHOT_TTL
+        ):
+            _MODEL_SNAPSHOT = tuple(_discover_models(timeout))
+            _MODEL_SNAPSHOT_AT = now
         return _MODEL_SNAPSHOT
+
+
+def sync_profile_catalog(profile: Any, models: list[str]) -> tuple[str, ...]:
+    """Pin a provider profile's curated floor to the catalog just discovered.
+
+    Hermes shows a provider's ``fallback_models`` (its curated floor) merged
+    with the live list, so a floor that is not the live catalog keeps retired
+    ids in the picker and hides newly launched ones. Pinning the floor to the
+    last discovery makes the picker list exactly the ids the relay serves.
+    """
+    discovered = tuple(dict.fromkeys(str(model) for model in models if model))
+    if not discovered:
+        return ()
+    profile.fallback_models = discovered
+    capabilities = dict(getattr(profile, "model_capabilities", None) or {})
+    for model in discovered:
+        capabilities.setdefault(model, {"supports_tools": True})
+    profile.model_capabilities = capabilities
+    return discovered
 
 
 def _session_id() -> str:
