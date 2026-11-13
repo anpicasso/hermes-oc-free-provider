@@ -1292,7 +1292,7 @@ def _stream_sse(
             if not isinstance(delta, dict):
                 delta = {}
                 choice["delta"] = delta
-            raw_calls = delta.pop("tool_calls", [])
+            raw_calls = delta.pop("tool_calls", None) or []
             choice_calls = calls.get(choice_index, {})
             for raw_call in raw_calls:
                 choice_calls = calls.setdefault(choice_index, {})

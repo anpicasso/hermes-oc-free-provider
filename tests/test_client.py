@@ -879,6 +879,32 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(wire[0]["tool_calls"][0]["function"]["arguments"], arguments)
         self.assertEqual(wire[1], messages[1])
 
+    def test_null_tool_calls_delta_does_not_crash_stream(self):
+        events = [
+            {
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"tool_calls": None},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "model": "m",
+                "choices": [
+                    {"index": 0, "delta": {"content": "OK"}, "finish_reason": "stop"}
+                ],
+            },
+        ]
+        chunks = list(
+            client._stream_sse(
+                iter(events), requested_model="m", mapped_tools={}
+            )
+        )
+        self.assertEqual(chunks[1]["choices"][0]["delta"]["content"], "OK")
+
     def test_catalog_intersects_live_zero_cost_tool_models(self):
         zen = {"data": [{"id": model} for model in ("free-a", "free-b", "paid")]}
         catalog = {
