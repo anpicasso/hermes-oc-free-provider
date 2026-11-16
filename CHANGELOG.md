@@ -2,6 +2,48 @@
 
 Notable changes to `oc-free-provider`.
 
+## 4.2.0 — 2026-11-16
+
+- **Session/cache affinity.** Scoped conversations retain one exact
+  official-generated native OpenCode session and a durable private workspace
+  per active profile/scope/model lane. The mapping lives in
+  `<profile>/plugin-data/oc-free-provider/data.db` through the documented
+  `plugins.plugin_storage.plugin_db` helper; Hermes' main session database is
+  untouched. A missing scope or profile stays ephemeral and never shares an
+  anonymous bucket.
+- **Lane identity uses both raw ids.** Normal/compression/`/branch`/gateway
+  lanes use `cache_scope_id`; `sub_<sha>` delegate scopes add the physical
+  `session_id` so siblings never merge (delegate compression resets affinity).
+  `/btw` and same-model review share the parent's lane and serialize; a `sub_`
+  scope without a physical id stays ephemeral.
+- **Companion protocol 5.** `open` can adopt an exact existing native id;
+  `advance` accepts generation N+1 after the new explicit `finish` boundary,
+  carries the current Hermes tool registry, and returns the event cursor
+  boundary. `finish` rejects parked executor results, interrupts/wait-settles a
+  live prompt and keeps the native session. Late events from a previous
+  generation can no longer be attributed to the next one.
+- **Recovery and isolation.** Native `GET /api/session/<id>` corroborates the
+  stored id and workspace before reuse. Only a real 404 resets affinity; fresh
+  allocation replaces the mapping and sets `Completion.affinity_reset`.
+  Per-scope cross-process ownership is held for the runtime lifetime (including
+  idle) and released only after the server stops; same-scope in-process calls
+  get a bounded busy refusal. Unsafe-finish recovery allocates a fresh session
+  with exactly one runtime lease.
+- **Bounded retention.** Idle process eviction keeps durable native data and
+  the mapping. `RuntimePool.MAX_OWNERS` bounds live lanes and
+  `oc_affinity.prune()` removes inactive owned scope directories plus their rows
+  under the ownership lock (default 14 days), re-reading eligibility under that
+  lock. Mapping rows contain no transcript or credentials; native data remains
+  sensitive.
+- **Verification.** The full offline suite (121 tests) passes with the official
+  2.3.0 binary and an isolated `HERMES_HOME`; a bounded hosted two-turn probe
+  confirmed one native id and cache-read usage, while the ephemeral control also
+  showed provider-side cache hits, so no causal speedup is claimed.
+- **Real CLI acceptance.** An isolated Hermes profile retained the exact native
+  session id across gateway shutdown and resumed conversation. Two real
+  delegated siblings received distinct native ids. All 11 acceptance assertions
+  passed; the production gateway was not restarted.
+
 ## 4.1.0 — 2026-11-16
 
 Native OpenCode provider, read-only catalog policy.

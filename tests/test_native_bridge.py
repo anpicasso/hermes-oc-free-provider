@@ -107,7 +107,7 @@ class RuntimeTests(RuntimeCase):
         fixture = self.fixture(["text_stop"])
         runtime = self.runtime(fixture)
         info = runtime.hello()
-        self.assertEqual(info["protocol"], 4)
+        self.assertEqual(info["protocol"], 5)
         self.assertEqual(info["companion"], "hermes-oc-native")
         self.assertEqual(info["binaryVersion"], "2.3.0")
         self.assertEqual(runtime.verify_ownership(), runtime.process.pid)
@@ -141,7 +141,7 @@ class RuntimeTests(RuntimeCase):
             runtime.start()
             self._runtimes.append(runtime)
             self.assertEqual(runtime.binary, helpers.BINARY)
-            self.assertEqual(runtime.hello()["protocol"], 4)
+            self.assertEqual(runtime.hello()["protocol"], 5)
         finally:
             if old_path is None:
                 os.environ.pop("PATH", None)
@@ -166,7 +166,7 @@ class RuntimeTests(RuntimeCase):
 
     def test_handshake_rejects_wrong_protocol_or_version(self) -> None:
         good = {
-            "protocol": 4,
+            "protocol": 5,
             "companion": "hermes-oc-native",
             "binaryVersion": "2.3.0",
             "tools": [{"id": "read", "forwarded": True}],
@@ -196,7 +196,7 @@ class RuntimeTests(RuntimeCase):
             cleanup=False,
         ).start()
         self._runtimes.append(runtime)
-        self.assertEqual(runtime.hello()["protocol"], 4)
+        self.assertEqual(runtime.hello()["protocol"], 5)
         self.assertNotIn("nonce", runtime.list_models())
         self.assertTrue(all(row.get("package") for row in runtime.catalog() if row.get("providerID") == "opencode"))
 

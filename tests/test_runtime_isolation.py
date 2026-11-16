@@ -63,7 +63,7 @@ class RuntimeIsolationTests(unittest.TestCase):
                     self.assertIn(caught.exception.code, (401, 403))
                 finally:
                     caught.exception.close()
-            self.assertEqual(runtime.hello(refresh=True)["protocol"], 4)
+            self.assertEqual(runtime.hello(refresh=True)["protocol"], 5)
             runtime.stop()
             assert_process_gone(pid)
             self.assertTrue(hostile.exists())

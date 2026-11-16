@@ -35,7 +35,7 @@ from oc_watchdog import ConversationFailed, Watchdog, WatchdogRefused
 # Minimum official version; the handshake verifies the loaded companion and
 # binary at runtime. A newer release is accepted but never assumed compatible.
 SUPPORTED_BINARY_VERSION = ".".join(str(part) for part in MIN_VERSION)
-SUPPORTED_COMPANION_PROTOCOL = 4
+SUPPORTED_COMPANION_PROTOCOL = 5
 COMPANION_ID = "hermes-oc-native"
 SUPPORTED_PACKAGE = "@opencode/ai/providers/openai-compatible"
 
@@ -411,6 +411,7 @@ class NativeRuntime:
         companion: str | Path | None = None,
         root: str | Path | None = None,
         workspace: str | Path | None = None,
+        durable_root: bool = False,
         startup_timeout: float = 60.0,
         rpc_timeout: float = 120.0,
         execute_deadline: float = 120.0,
@@ -423,6 +424,9 @@ class NativeRuntime:
         self._companion_arg = companion
         self._root_arg = root
         self._workspace_arg = workspace
+        # Durable runtimes reuse an owned root across process eviction. The
+        # caller owns retention/removal; cleanup=True would delete it.
+        self._durable_root = bool(durable_root)
         # Test subclasses may set these before start; production keeps them
         # empty so no fixture provider or fixture option ever loads.
         self.plugin_options: dict = {}
@@ -509,9 +513,18 @@ class NativeRuntime:
         # directories: never write, chmod, or delete their existing contents.
         base_arg = self._workspace_arg or self._root_arg or os.environ.get(ROOT_ENV)
         base = Path(base_arg).expanduser().resolve() if base_arg else Path(tempfile.gettempdir()).resolve()
-        if not base.is_dir():
+        if not self._durable_root and not base.is_dir():
             raise RuntimeClosed(f"runtime parent directory does not exist: {base}")
-        self.root = Path(tempfile.mkdtemp(prefix="hermes-oc-native-", dir=str(base))).resolve()
+        if self._durable_root:
+            if not base_arg:
+                raise RuntimeClosed("a durable runtime requires an explicit owned root")
+            self.root = base.resolve()
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                raise RuntimeClosed(f"durable runtime root is unusable: {error}") from None
+        else:
+            self.root = Path(tempfile.mkdtemp(prefix="hermes-oc-native-", dir=str(base))).resolve()
         self.workspace = self.root / "project"
         self.home = self.root / "home"
         for directory in (self.root, self.workspace, self.home, self.root / "tmp", self.root / "state", self.root / "cache", self.root / "data", self.root / "config"):
@@ -832,13 +845,24 @@ class NativeRuntime:
             reason = (self.watchdog.failure or {}).get("reason", "runtime teardown in progress")
             raise RuntimeClosed(f"OpenCode runtime failed: {reason}")
 
-    def new_session(self, provider_id: str, model_id: str, hermes_tools: list[dict] | None = None) -> "Session":
+    def new_session(
+        self,
+        provider_id: str,
+        model_id: str,
+        hermes_tools: list[dict] | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> "Session":
         self._guard_alive()
         if not isinstance(provider_id, str) or not provider_id or not isinstance(model_id, str) or not model_id:
             raise SessionRefused("provider_id and model_id must be non-empty strings")
         payload: dict[str, Any] = {"providerID": provider_id, "modelID": model_id}
         if hermes_tools is not None:
             payload["hermesTools"] = hermes_tools
+        if session_id is not None:
+            if not isinstance(session_id, str) or not session_id:
+                raise SessionRefused("session_id must be a non-empty string when supplied")
+            payload["sessionID"] = session_id
         deadline = time.monotonic() + 15.0
         last: Exception | None = None
         while time.monotonic() < deadline:
@@ -858,6 +882,25 @@ class NativeRuntime:
         if not session_id:
             raise SessionRefused("companion returned no session id")
         return Session(self, session_id)
+
+    def get_session(self, session_id: str, *, timeout: float | None = None) -> dict | None:
+        """Corroborate one persisted native session; None only on a real 404."""
+        self._guard_alive()
+        if not isinstance(session_id, str) or not session_id:
+            raise SessionRefused("a native session id is required")
+        path = f"/api/session/{urllib.parse.quote(session_id, safe='')}"
+        try:
+            payload = self.get(path, timeout=timeout or min(15.0, self.rpc_timeout))
+        except RpcRefused as error:
+            if error.status == 404 or error.code == "http.404":
+                return None
+            raise
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise SessionRefused("native session get returned no session object")
+        if str(data.get("id") or "") != session_id:
+            raise SessionRefused("native session get returned a different session id")
+        return data
 
     # -- ownership / teardown ---------------------------------------------
     def verify_ownership(self) -> int:
@@ -1047,7 +1090,15 @@ class Session:
                 break
         raise CompletionRefused(f"no matching native event within {timeout:.1f}s (session {self.session_id})")
 
-    def advance(self, *, snapshot: list[dict], system_parts: list[str], user_text: str, timeout: float = 60.0) -> dict:
+    def advance(
+        self,
+        *,
+        snapshot: list[dict],
+        system_parts: list[str],
+        user_text: str,
+        timeout: float = 60.0,
+        hermes_tools: list[dict] | None = None,
+    ) -> dict:
         self._guard()
         generation = self.generation + 1
         payload = {
@@ -1057,8 +1108,17 @@ class Session:
             "systemParts": list(system_parts),
             "userText": user_text,
         }
+        if hermes_tools is not None:
+            payload["hermesTools"] = hermes_tools
         output = self.runtime.rpc("advance", payload, timeout=timeout)
         self.generation = generation
+        # Anything emitted before the authorization belongs to an older
+        # generation (late interrupt/step events). Start the read window after
+        # the boundary event so it cannot be mistaken for this generation.
+        seq = output.get("seq") if isinstance(output, dict) else None
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            self.cursor = max(self.cursor, seq)
+        self._pending.clear()
         return output
 
     def state(self, timeout: float = 30.0) -> dict:
@@ -1094,17 +1154,37 @@ class Session:
                 raise
             return self.runtime.rpc("settle", {"sessionID": self.session_id, "results": results}, timeout=timeout)
 
+    def finish(self, timeout: float = 20.0) -> dict:
+        """Settle the previous generation, keeping the native session identity.
+
+        Parked native tool executions are rejected, an in-flight prompt is
+        interrupted, and the event cursor advances past that generation's tail.
+        The next ``advance`` installs a fresh canonical snapshot.
+        """
+        self._guard()
+        output = self.runtime.rpc("finish", {"sessionID": self.session_id}, timeout=timeout)
+        if not isinstance(output, dict):
+            raise SessionRefused("companion finish returned a non-object")
+        seq = output.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            self.cursor = max(self.cursor, seq)
+        self._pending.clear()
+        return output
+
     def close(self) -> dict:
         with self._lock:
             if self.closed:
                 return {"closed": True}
             self.closed = True
             if not self.runtime.alive:
+                self._pending.clear()
                 return {"closed": True, "skipped": "runtime not running"}
             try:
                 return self.runtime.rpc("close", {"sessionID": self.session_id}, timeout=15.0)
             except (RpcRefused, RuntimeClosed):
                 return {"closed": True, "skipped": "runtime unavailable"}
+            finally:
+                self._pending.clear()
 
     def _completion(self, events: Iterable[dict]) -> dict | None:
         for event in events:
@@ -1198,6 +1278,7 @@ class Session:
         system_parts: list[str],
         user_text: str,
         timeout: float = 120.0,
+        hermes_tools: list[dict] | None = None,
     ) -> StepResult:
         """Issue one generation permit and return only a validated completion."""
         self._guard()
@@ -1205,7 +1286,13 @@ class Session:
         # the context hook so every advertised tool has a wrapper.
         self.runtime.reconcile()
         deadline = time.monotonic() + timeout
-        self.advance(snapshot=snapshot, system_parts=system_parts, user_text=user_text, timeout=min(60.0, timeout))
+        self.advance(
+            snapshot=snapshot,
+            system_parts=system_parts,
+            user_text=user_text,
+            timeout=min(60.0, timeout),
+            hermes_tools=hermes_tools,
+        )
         generation = self.generation
 
         def boundary(event: dict) -> bool:

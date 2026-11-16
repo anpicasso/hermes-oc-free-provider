@@ -1,7 +1,8 @@
 # Native runtime and client API
 
 Status: implementation contract for `oc_runtime.py`, `oc_binary.py`,
-`oc_watchdog.py` and `hermes_oc_client.py` in 4.1.0. The official OpenCode binary is
+`oc_watchdog.py`, `oc_affinity.py` and `hermes_oc_client.py` in the current
+source (4.2.0). The official OpenCode binary is
 unmodified. Hermes owns instructions, canonical history, approvals and every
 Hermes tool effect; OpenCode owns its process, model discovery, authentication
 and vendor transport.
@@ -19,7 +20,7 @@ and vendor transport.
 - Every candidate is validated with a bounded `<binary> --version` probe (argv
   list, `shell=False`, scrubbed environment). A stale hint or stale saved path
   never wins over a working PATH entry; it falls through to the next candidate.
-- Companion protocol: `4`, companion id `hermes-oc-native`. Selection: bundled
+- Companion protocol: `5`, companion id `hermes-oc-native`. Selection: bundled
   `companion/index.ts` next to `oc_runtime.py`; `companion=` or
   `HERMES_OPENCODE_COMPANION` override for packaging/tests. A missing or
   mismatched companion refuses before inference.
@@ -73,6 +74,7 @@ NativeRuntime(
     companion: str | Path | None = None,
     root: str | Path | None = None,
     workspace: str | Path | None = None,
+    durable_root: bool = False,
     startup_timeout: float = 60.0,
     rpc_timeout: float = 120.0,
     execute_deadline: float = 120.0,
@@ -85,12 +87,18 @@ NativeRuntime(
 prove ownership and bound teardown, but no supported path arms a JavaScript
 deadline. Native `execute` is refused before any interpreter runs.
 
+`durable_root=True` treats `root=` as the owned runtime directory itself
+(creating it if absent) instead of creating a `mkdtemp` child. Retained
+affinity lanes use this with `cleanup=False`: process eviction stops the server
+but keeps `project/`, `data/` and the rest of the native workspace for the next
+process. Callers own removal.
+
 - `start() -> NativeRuntime`: validates the binary version, prepares the
   private root, spawns the process, validates the stdio readiness URL and
   performs `hello()`. Any failure kills/reaps the owned process group.
 - `hello() -> dict`: cached handshake. Retries only transient
   `rpc.unavailable`/`rpc.internal`/`runtime.transport` until
-  `startup_timeout`; validates `protocol == 4`, companion id, binary version
+  `startup_timeout`; validates `protocol == 5`, companion id, binary version
   >= 2.3.0, and requires every registered tool to report `forwarded: true`.
   Each tool row also reports `hermes: true` when it was registered from a Hermes
   schema rather than being a native OpenCode tool.
@@ -101,7 +109,13 @@ deadline. Native `execute` is refused before any interpreter runs.
   time, status, enabled, variants`. Provider settings, API keys, headers, base
   URLs and credentials are never returned.
 - `list_models(*, timeout=None) -> list[str]`: native ids in catalog order.
-- `new_session(provider_id, model_id, hermes_tools=None) -> Session`.
+- `new_session(provider_id, model_id, hermes_tools=None, *, session_id=None) -> Session`.
+  With `session_id`, the companion adopts that exact existing native session
+  (never minting or recreating an id) after verifying it exists.
+- `get_session(session_id, *, timeout=None) -> dict | None`: official
+  `GET /api/session/<id>`. Returns `None` only for a real 404; transport,
+  permission or storage errors propagate. Used to corroborate a persisted id
+  and its workspace before reuse.
 - `rpc(method, payload=None, *, timeout=None) -> dict`: authenticated loopback
   JSON RPC.
 - `get(path, *, timeout=None) -> dict`: authenticated loopback GET, only
@@ -159,7 +173,17 @@ come from OpenCode's own ending events (never from the raw SSE body).
 opaque per-part metadata received from those events, position-keyed for replay.
 
 Other methods: `read()`, `state()`, `wait_pending()`, `decide(allow, reason)`,
-`settle(results)`, `events_until(predicate, timeout)`, `close()`.
+`settle(results)`, `finish()`, `events_until(predicate, timeout)`, `close()`.
+
+- `advance()` moves the event cursor past the authorization boundary, so a late
+  interrupt/step event from an earlier generation cannot be attributed to the
+  new one.
+- `finish()` is the explicit generation boundary for a retained session. The
+  companion rejects parked executor results, interrupts an in-flight prompt,
+  waits (bounded) for the run to leave the active set, keeps the native session
+  and returns `{settled, interrupted, seq}`. `advance(generation=N+1)` is
+  refused until `finish()` settles generation N. A false `settled` means the
+  caller must abandon that native session and allocate a fresh official id.
 
 - `read()` polls the companion's per-session event log with a cursor. The
   companion long-polls for about 900 ms and returns an empty batch rather than
@@ -185,9 +209,57 @@ dropping them. The production translator carries representable media as native
 `media`/`file` parts. In both cases a request without a non-empty user message
 is refused because OpenCode needs a prompt anchor.
 
-Ordinary generations use one short-lived session per Hermes request. The client
-closes the session after the step; the next request installs a fresh canonical
-snapshot. OpenCode's retained transcript is never reused as Hermes history.
+Generations without a logical scope (auxiliary/stateless calls) use one
+short-lived native session per request and close it after the step. A scoped
+request (`hermes_session_context`, emitted by the profile from
+`cache_scope_id`/`session_id`) retains one native session per active
+profile/scope/model lane. `finish()` closes the previous generation, then the
+next request replaces the native transcript with the canonical Hermes snapshot.
+OpenCode's retained transcript is never reused as Hermes history and the
+companion never executes a Hermes tool.
+
+### Retained affinity lane
+
+- The mapping is one profile-scoped SQLite row written through the documented
+  `plugins.plugin_storage.plugin_db("oc-free-provider")`: schema version, local
+  scope key, exact official native id, native provider/model and last-used.
+  Hermes' main session database is never opened or modified.
+- The profile sends both raw ids (`session_id`, `cache_scope_id`) in
+  `hermes_session_context`; the client derives the local lane:
+  - normal/compression/`/branch`/gateway: `cache_scope_id` (stable across
+    compression rotation and per-response gateway ids);
+  - `sub_<sha>` delegate scopes: `sub:<scope>:<session_id>`, because delegate
+    siblings share one cache bucket. Delegate compression rotates the physical
+    id and therefore resets delegate affinity explicitly;
+  - `/btw` and same-model review share the parent's two ids by design, so they
+    share one lane and are serialized (a concurrent call gets busy);
+  - missing `session_id` on a `sub_` scope or both ids absent stays ephemeral,
+    never a shared anonymous bucket.
+  The local key is a SHA-256 of `(profile home, lane, provider, model)`. It is
+  never a wire id.
+- First use calls native create without an id, then persists the exact returned
+  id. Reuse verifies it with native `GET /api/session/<id>` (id and workspace).
+  Only a real 404 resets affinity: allocate a fresh official id, replace the
+  mapping and report `Completion.affinity_reset = True` plus a log warning.
+  Transport/permission/storage errors propagate instead of being treated as
+  absence.
+- Native `project/`, `data/`, config and cache live under
+  `<profile>/plugin-data/oc-free-provider/native/<scope-key>/` and survive idle
+  process eviction (`durable_root=True`, `cleanup=False`). The root is stable,
+  so the native system prefix that names the working directory does not change
+  between turns.
+- Per-scope POSIX/Windows advisory ownership is held for the native runtime
+  lifetime, including idle: a competing process gets a bounded busy refusal
+  before it can start a second server on the same durable root. The owner stops
+  the server before releasing the lock on close/eviction. An in-process
+  non-blocking generation lock serializes same-scope threads. SQLite
+  transactions stay short and are never open during inference.
+- `RuntimePool.TTL_SECONDS` (idle process eviction) and `MAX_OWNERS` bound live
+  runtimes. `oc_affinity.prune()` removes inactive owned scope directories and
+  their rows under the same lock (default 14 days), re-reading the row's
+  `last_used` under that lock before removal; an expired scope loses affinity
+  explicitly on its next use. Mapping rows contain no transcript or credentials;
+  native data may contain prompts/results and is sensitive.
 
 ## `hermes_oc_client.py`
 
@@ -218,7 +290,10 @@ OpenCodeClient(
 compatibility. `command` is core's resolved external-process executable: when it
 is an absolute existing path it becomes a validated **hint** to the runtime
 resolver (never used unvalidated, never allowed to outrank a usable PATH).
-`session_id`/`profile_home` are used only for the owner key described below.
+Constructor `session_id`/`profile_home` are only the legacy explicit owner key
+described below. Retained affinity uses the per-request
+`hermes_session_context` top-level field (consumed by the client, never sent to
+the vendor) emitted by `ProviderProfile.build_api_kwargs_extras`.
 Native OpenCode state owns authentication; this facade owns no HTTP transport.
 `LOGICAL_BASE_URL = "opencode-native://local"` is identity metadata only.
 `supports_streaming = False`.
@@ -281,8 +356,10 @@ the client returns a terminal refusal completion naming the tool, with no tool
 call, no effect and no extra inference. Native `execute` keeps its dedicated
 refusal message.
 
-Result: `Completion(choices, usage, model, finish_reason, text, reasoning,
-tool_calls, native_tool_calls, native_usage)`. `usage` is a `Usage` object with
+Result: `Completion(choices, usage, model, finish_reason, text, affinity_reset,
+reasoning, tool_calls, native_tool_calls, native_usage)`. `affinity_reset` is
+true only when a persisted native session was missing and a fresh official id
+replaced the mapping. `usage` is a `Usage` object with
 measured values; it is always present for a successful completion (zero counts
 are valid). `tool_calls` are ordinary Hermes calls; `native_tool_calls` keeps
 the raw native batch for diagnostics. `choices[0].message.reasoning_details`

@@ -10,13 +10,16 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
+import logging
 import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+import oc_affinity
 import oc_catalog
 import oc_translate
 from oc_runtime import (
@@ -31,6 +34,8 @@ from oc_runtime import (
 )
 
 LOGICAL_BASE_URL = "opencode-native://local"
+LOGGER = logging.getLogger(__name__)
+PROVIDER_NAME = "opencode-free"
 EXECUTE_UNSUPPORTED = (
     "native JavaScript execute is unsupported; use the enabled Hermes Python execute_code tool"
 )
@@ -111,6 +116,9 @@ class Completion:
     model: str
     finish_reason: str
     text: str
+    # True only when a persisted native session was missing and a fresh
+    # official ID replaced the mapping. Never a wire identifier.
+    affinity_reset: bool = False
     reasoning: str | None = None
     tool_calls: list = field(default_factory=list)
     native_tool_calls: list = field(default_factory=list)
@@ -157,6 +165,16 @@ class RuntimeOwner:
         self._closed = False
         self.last_used = time.monotonic()
         self._lock = threading.RLock()
+        # Retained lane state. The generation lock serialises same-scope calls
+        # in this process; a cross-process lock is taken per request too.
+        self.generation_lock = threading.Lock()
+        self.scope_key: str | None = None
+        self.session: Any = None
+        self.native_session_id: str | None = None
+        # Cross-process ownership is held for the runtime lifetime (including
+        # idle), so another process cannot start a second server on this root
+        # or prune/reset its data.
+        self.ownership_lock: oc_affinity.ScopeLock | None = None
 
     def _build_runtime(self) -> NativeRuntime:
         return self._factory() if self._factory is not None else NativeRuntime(**self._kwargs)
@@ -170,6 +188,7 @@ class RuntimeOwner:
                     runtime.stop()
                 finally:
                     self._runtime = None
+                    self.session = None
         if self._runtime is None:
             self._runtime = self._build_runtime()
         runtime = self._runtime
@@ -209,14 +228,36 @@ class RuntimeOwner:
                 self._refs -= 1
             self.last_used = time.monotonic()
 
+    def ensure_ownership(self, profile_home: str, key: str) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeClosed("runtime owner is closed")
+            if self.ownership_lock is None:
+                self.ownership_lock = oc_affinity.acquire_lock(profile_home, key)
+
     def close(self) -> None:
+        lock = None
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             self._refs = 0
-            if self._runtime is not None:
+            try:
+                if self._runtime is not None:
+                    self._runtime.stop()
+            finally:
+                self.session = None
+                lock = self.ownership_lock
+                self.ownership_lock = None
+        if lock is not None:
+            lock.release()
+
+    def cancel(self) -> None:
+        """Poison this process lane; durable native state and mapping survive."""
+        with self._lock:
+            if self._runtime is not None and self._runtime.alive:
                 self._runtime.stop()
+            self.session = None
 
     @property
     def pid(self) -> int | None:
@@ -231,12 +272,17 @@ class RuntimePool:
     _lock = threading.RLock()
     TTL_SECONDS = 300.0
     REAP_INTERVAL = 1.0
+    MAX_OWNERS = 32
     _reaper: threading.Thread | None = None
 
     @staticmethod
     def key_for(profile_home: str, session_id: str) -> str:
         # JSON pair: neither path nor session text can create the other's key.
         return json.dumps([str(profile_home), str(session_id)], ensure_ascii=False)
+
+    @staticmethod
+    def key_for_scope(profile_home: str, scope: str, provider_id: str, model_id: str) -> str:
+        return oc_affinity.scope_key(profile_home, scope, provider_id, model_id)
 
     @classmethod
     def _ensure_reaper(cls) -> None:
@@ -279,20 +325,39 @@ class RuntimePool:
             str(runtime_kwargs.get("companion") or ""),
             str(runtime_kwargs.get("root") or ""),
         )
+        evicted: RuntimeOwner | None = None
         with cls._lock:
             owner = cls._owners.get(key)
             if owner is None:
+                if len(cls._owners) >= cls.MAX_OWNERS:
+                    idle = sorted(
+                        (item for item in cls._owners.values() if item._refs == 0),
+                        key=lambda item: item.last_used,
+                    )
+                    if not idle:
+                        raise ControlRefused(
+                            "native runtime pool is at capacity with live scopes; retry when one finishes"
+                        )
+                    evicted = idle[0]
+                    cls._owners.pop(next(name for name, item in cls._owners.items() if item is evicted))
                 owner = RuntimeOwner(**runtime_kwargs)
                 owner.signature = signature  # type: ignore[attr-defined]
                 cls._owners[key] = owner
             elif getattr(owner, "signature", None) != signature:
                 raise RuntimeClosed(f"runtime owner key {key!r} was reused with a different configuration")
             owner.last_used = time.monotonic()
-            return owner
+        if evicted is not None:
+            evicted.close()
+        return owner
 
     @classmethod
     def prune(cls, now: float | None = None) -> None:
         cls._prune(now)
+
+    @classmethod
+    def active_keys(cls) -> set[str]:
+        with cls._lock:
+            return set(cls._owners)
 
     @classmethod
     def close(cls, key: str) -> None:
@@ -399,6 +464,7 @@ class OpenCodeClient:
                 self._owned_session_key = RuntimePool.key_for(str(profile_home), session_id)
         self._runtime = runtime
         self._owner: RuntimeOwner | None = runtime_owner
+        self._active_owner: RuntimeOwner | None = None
         self._owns_runtime = runtime is None and runtime_owner is None and self._owned_session_key is None
         self._runtime_acquired = False
         self._runtime_kwargs = {
@@ -526,42 +592,51 @@ class OpenCodeClient:
         if kwargs:
             raise ControlRefused(f"unsupported request controls: {', '.join(sorted(kwargs))}")
 
-    # -- inference ---------------------------------------------------------
-    def complete(
-        self,
-        messages: list[dict] | None = None,
-        tools: list[dict] | None = None,
-        *,
-        model: str | None = None,
-        stream: bool = False,
-        tool_choice: Any = None,
-        max_tokens: Any = None,
-        max_completion_tokens: Any = None,
-        temperature: Any = None,
-        top_p: Any = None,
-        stop: Any = None,
-        response_format: Any = None,
-        reasoning_effort: Any = None,
-        extra_body: Any = None,
-        timeout: float | None = None,
-        **kwargs: Any,
-    ) -> Completion:
-        self._validate_request(
-            stream=stream,
-            tool_choice=tool_choice,
-            max_tokens=max_tokens,
-            max_completion_tokens=max_completion_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            response_format=response_format,
-            reasoning_effort=reasoning_effort,
-            extra_body=extra_body,
-            **kwargs,
-        )
-        if messages is None:
-            raise ControlRefused("messages are required")
-        runtime = self._ensure_runtime()
+    # -- affinity ----------------------------------------------------------
+    @staticmethod
+    def _session_scope(context: Any) -> dict | None:
+        """Consume the provider-only per-request marker; never forward it."""
+        if context is None:
+            return None
+        if not isinstance(context, dict):
+            raise ControlRefused("hermes_session_context must be an object")
+        if context.get("version") != 2:
+            raise ControlRefused("hermes_session_context has an unsupported version")
+        session_id = context.get("session_id") or ""
+        cache_scope_id = context.get("cache_scope_id") or ""
+        for name, value in (("session_id", session_id), ("cache_scope_id", cache_scope_id)):
+            if not isinstance(value, str) or len(value) > 1024 or "\x00" in value:
+                raise ControlRefused(
+                    f"hermes_session_context.{name} must be a bounded string"
+                )
+        if not session_id and not cache_scope_id:
+            return None
+        if cache_scope_id.startswith("sub_"):
+            # Delegate siblings share one sub_<sha> cache bucket. The physical
+            # session is the only sibling-unique value; compression rotates it,
+            # so delegate affinity resets at compression by design.
+            if not session_id:
+                return None
+            lane = f"sub:{cache_scope_id}:{session_id}"
+        else:
+            # Normal/compression/gateway/branch: the scope is stable across
+            # physical-id rotation and per-response gateway ids.
+            lane = cache_scope_id or session_id
+        profile_home = _authoritative_profile_home()
+        if not profile_home:
+            # No profile identity means no safe shared bucket. Stay ephemeral.
+            return None
+        return {
+            "lane": lane,
+            "session_id": session_id,
+            "cache_scope_id": cache_scope_id,
+            "profile_home": profile_home,
+        }
+
+    @staticmethod
+    def _prepare_generation(
+        runtime: NativeRuntime, messages: list[dict], tools: list[dict] | None
+    ) -> tuple[oc_translate.WirePlan, Any]:
         # Every native registry id is reserved: a Hermes tool with the same name
         # gets a reversible wire alias instead of being dropped.
         native_ids = {
@@ -580,27 +655,32 @@ class OpenCodeClient:
             snapshot = oc_translate.snapshot_from_openai(messages, plan=plan)
         except oc_translate.SnapshotError as error:
             raise SnapshotRefused(str(error)) from None
-        selected_model = model or self.model
-        if not selected_model:
+        return plan, snapshot
+
+    @staticmethod
+    def _select_record(runtime: NativeRuntime, selected_model: str) -> dict:
+        if not isinstance(selected_model, str) or not selected_model:
             raise ModelRefused("an explicit native model id is required")
-        record = self.select_model(selected_model)
-        self._require_transport(record)
-        session = runtime.new_session(str(record["providerID"]), str(record["id"]), plan.register)
         try:
-            result = session.generate(
-                snapshot=snapshot.messages,
-                system_parts=snapshot.system_parts,
-                user_text=snapshot.user_text,
-                timeout=timeout or self.timeout,
-            )
-        finally:
-            session.close()
+            chosen = oc_catalog.select_model(runtime.catalog(), selected_model)
+        except oc_catalog.CatalogError as error:
+            raise ModelRefused(str(error)) from None
+        if not isinstance(chosen, dict):
+            raise ModelRefused("catalog policy returned a non-object model record")
+        if not chosen.get("providerID") or not chosen.get("id"):
+            raise ModelRefused("catalog policy returned a record without providerID/id")
+        return chosen
+
+    def _handle_result(
+        self, runtime: NativeRuntime, result: StepResult, record: dict, plan: oc_translate.WirePlan,
+        *, affinity_reset: bool = False,
+    ) -> Completion:
         if any(call.name == "execute" for call in result.calls):
             # ponytail: explicit terminal refusal, not a tool call. Handing JS
             # to Hermes would only produce an unknown-tool turn and a second
             # vendor inference; the companion refuses any execute attempt too.
             message = EXECUTE_UNSUPPORTED if "execute_code" in plan.host_to_wire else EXECUTE_UNSUPPORTED_NO_CODE
-            return self._refusal(result, record, message)
+            return self._refusal(result, record, message, affinity_reset=affinity_reset)
         native_ids = {
             str(tool.get("id"))
             for tool in (runtime.info or {}).get("tools", [])
@@ -617,9 +697,269 @@ class OpenCodeClient:
                 f"native tool(s) {', '.join(unsolicited)} are not exposed by this provider; "
                 "use the enabled Hermes tools instead"
             )
-            return self._refusal(result, record, message)
+            return self._refusal(result, record, message, affinity_reset=affinity_reset)
         calls = self._translate_calls(result, plan)
-        return self._completion(result, record, calls)
+        return self._completion(result, record, calls, affinity_reset=affinity_reset)
+
+    # -- inference ---------------------------------------------------------
+    def complete(
+        self,
+        messages: list[dict] | None = None,
+        tools: list[dict] | None = None,
+        *,
+        model: str | None = None,
+        stream: bool = False,
+        tool_choice: Any = None,
+        max_tokens: Any = None,
+        max_completion_tokens: Any = None,
+        temperature: Any = None,
+        top_p: Any = None,
+        stop: Any = None,
+        response_format: Any = None,
+        reasoning_effort: Any = None,
+        extra_body: Any = None,
+        timeout: float | None = None,
+        hermes_session_context: Any = None,
+        **kwargs: Any,
+    ) -> Completion:
+        self._validate_request(
+            stream=stream,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            response_format=response_format,
+            reasoning_effort=reasoning_effort,
+            extra_body=extra_body,
+            **kwargs,
+        )
+        if messages is None:
+            raise ControlRefused("messages are required")
+        selected_model = model or self.model
+        if not selected_model:
+            raise ModelRefused("an explicit native model id is required")
+        scope = self._session_scope(hermes_session_context)
+        if scope is None:
+            return self._complete_ephemeral(messages, tools, selected_model, timeout)
+        return self._complete_retained(scope, messages, tools, selected_model, timeout)
+
+    def _complete_ephemeral(
+        self, messages: list[dict], tools: list[dict] | None, selected_model: str, timeout: float | None
+    ) -> Completion:
+        runtime = self._ensure_runtime()
+        plan, snapshot = self._prepare_generation(runtime, messages, tools)
+        record = self._select_record(runtime, selected_model)
+        self._require_transport(record)
+        session = runtime.new_session(str(record["providerID"]), str(record["id"]), plan.register)
+        try:
+            result = session.generate(
+                snapshot=snapshot.messages,
+                system_parts=snapshot.system_parts,
+                user_text=snapshot.user_text,
+                timeout=timeout or self.timeout,
+                hermes_tools=plan.register,
+            )
+        finally:
+            session.close()
+        return self._handle_result(runtime, result, record, plan)
+
+    def _owner_kwargs(self, root: Path) -> dict:
+        kwargs = dict(self._runtime_kwargs)
+        kwargs.update(root=str(root), durable_root=True, cleanup=False)
+        return kwargs
+
+    def _acquire_owner(self, scope: dict, selected_model: str) -> RuntimeOwner:
+        key = oc_affinity.scope_key(
+            scope["profile_home"], scope["lane"], PROVIDER_NAME, selected_model
+        )
+        root = oc_affinity.native_root(scope["profile_home"], key)
+        oc_affinity.prune_once(
+            scope["profile_home"], active_keys=RuntimePool.active_keys() | {key}
+        )
+        owner = RuntimePool.acquire(key, **self._owner_kwargs(root))
+        owner.scope_key = key
+        try:
+            owner.ensure_ownership(scope["profile_home"], key)
+        except oc_affinity.AffinityBusy as error:
+            raise ControlRefused(str(error)) from None
+        return owner
+
+    @staticmethod
+    def _corroborate(data: dict, runtime: NativeRuntime, session_id: str) -> None:
+        if str(data.get("id") or "") != session_id:
+            raise oc_affinity.AffinityRefused(
+                "native session get returned a different id than the mapping"
+            )
+        location = data.get("location")
+        if isinstance(location, dict):
+            location = location.get("directory")
+        if not location:
+            location = data.get("directory")
+        if not isinstance(location, str) or not location:
+            raise oc_affinity.AffinityRefused(
+                "native session get returned no workspace; refusing to reuse it"
+            )
+        if runtime.workspace is None or (
+            Path(location).expanduser().resolve() != Path(runtime.workspace).resolve()
+        ):
+            raise oc_affinity.AffinityRefused(
+                "native session belongs to a different workspace; refusing to reuse it"
+            )
+
+    def _open_retained(
+        self,
+        owner: RuntimeOwner,
+        runtime: NativeRuntime,
+        scope: dict,
+        record: dict,
+        plan: oc_translate.WirePlan,
+    ) -> tuple[Any, bool]:
+        key = owner.scope_key
+        assert key is not None
+        provider_id = str(record["providerID"])
+        model_id = str(record["id"])
+        mapping = oc_affinity.load(scope["profile_home"], key, provider_id, model_id)
+        reset = False
+        session_id = None
+        if mapping is not None:
+            session_id = mapping["native_session_id"]
+            data = runtime.get_session(session_id)
+            if data is None:
+                # A real 404 is the only evidence of absence. Allocate a fresh
+                # official ID and replace the mapping atomically.
+                reset = True
+                session_id = None
+            else:
+                self._corroborate(data, runtime, session_id)
+        if session_id is None:
+            stale = owner.session
+            owner.session = None
+            owner.native_session_id = None
+            if stale is not None:
+                try:
+                    stale.close()
+                except Exception:  # noqa: BLE001 - the native session is already absent
+                    LOGGER.debug("stale native session cleanup failed", exc_info=True)
+            session = runtime.new_session(provider_id, model_id, plan.register)
+            try:
+                oc_affinity.save(
+                    scope["profile_home"], key, session.session_id, provider_id, model_id
+                )
+            except Exception:
+                try:
+                    session.close()
+                finally:
+                    raise
+            owner.native_session_id = session.session_id
+            owner.session = session
+            if reset:
+                LOGGER.warning(
+                    "OpenCode native affinity reset for scope %s…: previous session was missing",
+                    scope["lane"][:16],
+                )
+            return session, reset
+        existing = owner.session
+        if (
+            existing is not None
+            and existing.runtime is runtime
+            and existing.session_id == session_id
+        ):
+            session = existing
+        else:
+            session = runtime.new_session(
+                provider_id, model_id, plan.register, session_id=session_id
+            )
+            owner.session = session
+        owner.native_session_id = session_id
+        return session, reset
+
+    def _complete_retained(
+        self,
+        scope: dict,
+        messages: list[dict],
+        tools: list[dict] | None,
+        selected_model: str,
+        timeout: float | None,
+    ) -> Completion:
+        for _attempt in range(2):
+            owner = self._acquire_owner(scope, selected_model)
+            if not owner.generation_lock.acquire(blocking=False):
+                raise ControlRefused(
+                    "this OpenCode conversation is already running; wait for it to finish"
+                )
+            self._active_owner = owner
+            try:
+                try:
+                    runtime = owner.acquire()
+                except RuntimeClosed:
+                    # Reaper evicted this idle owner between lookup and
+                    # acquire; retry registers a fresh one.
+                    continue
+                try:
+                    return self._run_retained(
+                        owner, runtime, scope, messages, tools, selected_model, timeout
+                    )
+                finally:
+                    owner.release()
+            finally:
+                self._active_owner = None
+                owner.generation_lock.release()
+        raise RuntimeClosed("native affinity lane could not be acquired")
+
+    def _run_retained(
+        self,
+        owner: RuntimeOwner,
+        runtime: NativeRuntime,
+        scope: dict,
+        messages: list[dict],
+        tools: list[dict] | None,
+        selected_model: str,
+        timeout: float | None,
+    ) -> Completion:
+        plan, snapshot = self._prepare_generation(runtime, messages, tools)
+        record = self._select_record(runtime, selected_model)
+        self._require_transport(record)
+        session, reset = self._open_retained(owner, runtime, scope, record, plan)
+        if session.generation > 0:
+            settled = session.finish(timeout=min(20.0, float(timeout or self.timeout)))
+            if settled.get("settled") is False:
+                # The previous generation could not be recovered. Remove that
+                # native session and allocate a fresh official ID; never reuse
+                # an unknown state and never replay a Hermes effect.
+                try:
+                    session.close()
+                except Exception:  # noqa: BLE001 - poison the process lane instead
+                    LOGGER.warning("OpenCode failed session cleanup after unsafe finish", exc_info=True)
+                    owner.cancel()
+                    # `ensure()` follows the replacement without taking a new
+                    # lease; the caller already holds exactly one.
+                    runtime = owner.ensure()
+                owner.session = None
+                owner.native_session_id = None
+                session = runtime.new_session(
+                    str(record["providerID"]), str(record["id"]), plan.register
+                )
+                oc_affinity.save(
+                    scope["profile_home"], owner.scope_key or "", session.session_id,
+                    str(record["providerID"]), str(record["id"]),
+                )
+                owner.session = session
+                owner.native_session_id = session.session_id
+                reset = True
+                LOGGER.warning(
+                    "OpenCode native affinity reset for scope %s…: previous generation was unrecoverable",
+                    scope["lane"][:16],
+                )
+        result = session.generate(
+            snapshot=snapshot.messages,
+            system_parts=snapshot.system_parts,
+            user_text=snapshot.user_text,
+            timeout=timeout or self.timeout,
+            hermes_tools=plan.register,
+        )
+        return self._handle_result(runtime, result, record, plan, affinity_reset=reset)
 
     create = complete
 
@@ -639,7 +979,9 @@ class OpenCodeClient:
             translated.append(ToolCall(call_id=call_id, name=host_name, arguments=host_arguments))
         return translated
 
-    def _refusal(self, result: StepResult, record: dict, message: str) -> Completion:
+    def _refusal(
+        self, result: StepResult, record: dict, message: str, *, affinity_reset: bool = False
+    ) -> Completion:
         """A provider-authored terminal refusal: no tool call, no effect, no extra inference."""
         return Completion(
             choices=[Choice(message=AssistantMessage(content=message), finish_reason="stop")],
@@ -647,6 +989,7 @@ class OpenCodeClient:
             model=str(record.get("id") or ""),
             finish_reason="stop",
             text=message,
+            affinity_reset=affinity_reset,
             native_tool_calls=[dict(call.as_openai()) for call in result.calls],
             native_usage=result.usage,
         )
@@ -656,6 +999,8 @@ class OpenCodeClient:
         result: StepResult,
         record: dict,
         calls: list[ToolCall],
+        *,
+        affinity_reset: bool = False,
     ) -> Completion:
         tool_calls = [_call_view(call) for call in calls]
         carrier = oc_translate.native_carrier(result.native_parts)
@@ -673,6 +1018,7 @@ class OpenCodeClient:
             model=str(record.get("id") or ""),
             finish_reason=result.finish,
             text=result.text,
+            affinity_reset=affinity_reset,
             reasoning=result.reasoning,
             tool_calls=tool_calls,
             native_tool_calls=[dict(call.as_openai()) for call in result.calls],
@@ -695,7 +1041,7 @@ class OpenCodeClient:
             "messages", "tools", "model", "stream", "tool_choice", "max_tokens",
             "max_completion_tokens", "temperature", "top_p", "stop",
             "response_format", "reasoning_effort", "extra_body", "extra_headers",
-            "timeout",
+            "timeout", "hermes_session_context",
         }
         unknown = sorted(set(kwargs) - allowed)
         if unknown:
@@ -714,6 +1060,12 @@ class OpenCodeClient:
         raise ControlRefused("native streaming is not advertised")
 
     # -- lifecycle ---------------------------------------------------------
+    def cancel(self) -> None:
+        """Abort this lane's process; retained native data and mapping survive."""
+        owner = self._active_owner or self._owner
+        if owner is not None:
+            owner.cancel()
+
     def close(self) -> None:
         if self.is_closed:
             return

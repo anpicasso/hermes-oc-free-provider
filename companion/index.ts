@@ -30,7 +30,7 @@ import { createHash } from "node:crypto"
 
 const RPC_ID = "hermes-oc-native"
 const COMPANION = "hermes-oc-native"
-const PROTOCOL = 4
+const PROTOCOL = 5
 const EVENT_LOG_LIMIT = 512
 // Native descriptors may stay in the model-facing catalog. Everything else is
 // removed by identity: OpenCode's own `read` is the single compatibility tool,
@@ -103,6 +103,12 @@ type Session = {
   running: number | undefined
   userText: string | undefined
   started: boolean
+  // A prompt was admitted and its run has not reached idle yet. `finish`
+  // interrupts/waits for this before the next canonical generation.
+  promptRunning: boolean
+  // The previous generation reached an explicit boundary. A retained session
+  // accepts the next snapshot only after `finish` (or before its first one).
+  settled: boolean
   closed: boolean
   snapshot: Array<Record<string, unknown>>
   systemParts: string[]
@@ -210,6 +216,8 @@ function describe(session: Session) {
       decisions: Array.from(session.decisions.entries()).map(([callID, decision]) => ({ callID, ...decision })),
       executing: Array.from(session.executing),
       started: session.started,
+      promptRunning: session.promptRunning,
+      settled: session.settled,
       closed: session.closed,
       promptError: session.promptError ?? null,
       snapshotMessages: session.snapshot.length,
@@ -230,6 +238,8 @@ function closedState(sessionID: string) {
     decisions: [],
     executing: [],
     started: false,
+    promptRunning: false,
+    settled: true,
     closed: true,
     promptError: null,
     snapshotMessages: 0,
@@ -494,6 +504,9 @@ const RpcContract = Rpc.define({
         properties: {
           providerID: { type: "string" },
           modelID: { type: "string" },
+          // Exact native ID allocated by OpenCode on an earlier run. The
+          // companion verifies it exists before adopting it; it never mints one.
+          sessionID: { type: "string" },
           // First-class Hermes tools. `codemode: true` opts one into Code Mode
           // so an approved `execute` program can call `tools.<name>`; the call
           // still parks in forwardExecutor and Hermes executes it.
@@ -531,8 +544,37 @@ const RpcContract = Rpc.define({
           // system parts. They never replace the native prompt.
           systemParts: { type: "array", items: { type: "string" } },
           userText: { type: "string" },
+          // Current Hermes registrations for this generation. Pure additions
+          // are allowed; the session being advanced is never treated as a
+          // conflicting live generation.
+          hermesTools: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                description: { type: "string" },
+                parameters: JsonObject,
+                codemode: { type: "boolean" },
+              },
+              required: ["name", "description"],
+              additionalProperties: false,
+            },
+          },
         },
         required: ["sessionID", "generation"],
+        additionalProperties: false,
+      },
+      output: JsonObject,
+      errors: { invalid_state: JsonObject },
+    },
+    // Explicit generation boundary: settle parked executors, interrupt a
+    // running prompt, discard its results, and keep the native session.
+    finish: {
+      input: {
+        type: "object",
+        properties: { sessionID: { type: "string" } },
+        required: ["sessionID"],
         additionalProperties: false,
       },
       output: JsonObject,
@@ -803,7 +845,7 @@ export default Plugin.define({
     // the public editor. Names must not collide with the native registry;
     // Python supplies a reversible wire alias before calling `open`, so a
     // Hermes capability is never dropped because OpenCode shares its name.
-    const registerHermesTools = async (definitions: any[]) => {
+    const registerHermesTools = async (definitions: any[], exceptSessionID?: string) => {
       if (definitions.length > MAX_HERMES_TOOLS)
         throw new Error(`hermes-oc-native: too many Hermes tools: ${definitions.length} > ${MAX_HERMES_TOOLS}`)
       const current: any[] = await ctx.tool.list()
@@ -844,7 +886,9 @@ export default Plugin.define({
       // swap a definition or remove a tool under it; the next `open` after all
       // sessions close may revise. Pure additions do not change an existing
       // definition and stay allowed.
-      const live = Array.from(sessions.values()).filter((session) => !session.closed)
+      const live = Array.from(sessions.values()).filter(
+        (session) => !session.closed && session.id !== exceptSessionID,
+      )
       if (live.length > 0 && (revised.length > 0 || stale.length > 0)) {
         const affected = [...pending, ...revised].map((tool) => String(tool.name)).concat(stale)
         const what = revised.length > 0 ? "Hermes tool definition changed" : "Hermes tool removed"
@@ -1263,11 +1307,33 @@ export default Plugin.define({
           return context.error("invalid_state", `live session limit ${MAX_LIVE_SESSIONS} reached`, {
             sessions: sessions.size,
           })
-        const created: any = await ctx.session.create({
-          location: { directory: ctx.location.directory },
-          model: { providerID, id: modelID },
-        })
-        const info = created?.data ?? created
+        // Reuse only an exact native ID allocated by OpenCode on an earlier
+        // run. A missing ID is reported; the caller allocates a fresh official
+        // one and replaces its mapping (never recreate an invented id).
+        let info: any
+        const requested = typeof input.sessionID === "string" && input.sessionID ? input.sessionID : undefined
+        if (requested) {
+          try {
+            const existing: any = await ctx.session.get({ sessionID: requested })
+            info = existing?.data ?? existing
+          } catch (error) {
+            return context.error("invalid_state", `native session ${requested} no longer exists`, {
+              sessionID: requested,
+              missing: true,
+            })
+          }
+          if (!info || String(info.id ?? info.sessionID ?? "") !== requested)
+            return context.error("invalid_state", `native session ${requested} returned a different id`, {
+              sessionID: requested,
+              missing: true,
+            })
+        } else {
+          const created: any = await ctx.session.create({
+            location: { directory: ctx.location.directory },
+            model: { providerID, id: modelID },
+          })
+          info = created?.data ?? created
+        }
         const session: Session = {
           id: String(info.id ?? info.sessionID),
           generation: 0,
@@ -1275,6 +1341,8 @@ export default Plugin.define({
           running: undefined,
           userText: undefined,
           started: false,
+          promptRunning: false,
+          settled: true,
           closed: false,
           snapshot: [],
           systemParts: [],
@@ -1293,8 +1361,13 @@ export default Plugin.define({
           waiters: new Set(),
         }
         sessions.set(session.id, session)
-        emit(session, "opened", { model: `${providerID}/${modelID}` })
-        return { sessionID: session.id, location: ctx.location.directory, model: `${providerID}/${modelID}` }
+        emit(session, "opened", { model: `${providerID}/${modelID}`, reused: Boolean(requested) })
+        return {
+          sessionID: session.id,
+          location: ctx.location.directory,
+          model: `${providerID}/${modelID}`,
+          reused: Boolean(requested),
+        }
       },
 
       advance: async (input: any, context: any) => {
@@ -1318,12 +1391,13 @@ export default Plugin.define({
           Array.from(session.decisions.values()).some((decision) => !decision.allow)
         if ((session.gates.size > 0 || session.executing.size > 0) && !afterRelease && !deniedRelease)
           return context.error("invalid_state", "execute is still parked or running", { sessionID: session.id })
-        if (input.generation > 1 && !afterRelease && !deniedRelease)
-          return context.error(
-            "invalid_state",
-            "same-session advance is only the execute release boundary; open a fresh session",
-            { sessionID: session.id, generation: input.generation },
-          )
+        // A retained session accepts the next canonical generation only after
+        // the previous one reached the explicit boundary. Never advance over a
+        // parked executor or a live run.
+        if (!session.settled)
+          return context.error("invalid_state", "previous generation must be finished first; call finish", {
+            sessionID: session.id,
+          })
         if (!Array.isArray(input.snapshot))
           return context.error("invalid_state", "advance requires a canonical snapshot array", {
             sessionID: session.id,
@@ -1348,7 +1422,18 @@ export default Plugin.define({
             bytes: systemBytes,
           })
         await ensureForwarded()
+        // Late tools enter on the next generation; pure additions are allowed
+        // while this session advertises the previous registry. An omitted list
+        // leaves the registry untouched (direct-protocol callers).
+        if (Array.isArray(input.hermesTools)) {
+          try {
+            await registerHermesTools(input.hermesTools, session.id)
+          } catch (error) {
+            return context.error("invalid_state", String((error as Error)?.message ?? error), {})
+          }
+        }
         session.generation = input.generation
+        session.settled = false
         session.rejectReason = undefined
         // New primary request: no step/message state from the previous
         // generation may decide which assistant message is primary.
@@ -1382,17 +1467,104 @@ export default Plugin.define({
           emit(session, "execute_released", { callID, allowed: true })
           gate.resolve()
         }
-        if (!session.started) {
-          session.started = true
-          void ctx.session
-            .prompt({ sessionID: session.id, text: session.userText ?? "hermes-generation" })
-            .then(() => emit(session, "prompt_settled", {}))
-            .catch((error: unknown) => {
-              session.promptError = String(error)
-              emit(session, "prompt_error", { message: String(error) })
-            })
+        // Every canonical generation is one new prompt. The context hook
+        // replaces the transcript, so OpenCode's retained history is never
+        // replayed as context.
+        session.started = true
+        session.promptRunning = true
+        const generation = input.generation
+        void ctx.session
+          .prompt({ sessionID: session.id, text: session.userText ?? "hermes-generation" })
+          .then(async () => {
+            if (session.generation === generation) emit(session, "prompt_settled", { generation })
+            // Admission is not completion. Wait for the run to reach idle; a
+            // tool-parked run stays active until `finish` rejects its executors.
+            try {
+              await ctx.session.wait({ sessionID: session.id })
+            } catch (error) {
+              if (session.generation === generation) session.promptError = String(error)
+            }
+            if (session.generation === generation) {
+              session.promptRunning = false
+              emit(session, "prompt_idle", { generation })
+            }
+          })
+          .catch((error: unknown) => {
+            // A late rejection from a prior generation must not poison the
+            // current one. Report it as diagnostic only.
+            if (session.generation !== generation) {
+              emit(session, "prompt_error", { message: String(error), generation, stale: true })
+              return
+            }
+            session.promptError = String(error)
+            session.promptRunning = false
+            emit(session, "prompt_error", { message: String(error), generation })
+          })
+        return {
+          generation: input.generation,
+          authorized: true,
+          seq: session.seq,
+          session: describe(session),
         }
-        return { generation: input.generation, authorized: true, session: describe(session) }
+      },
+
+      // Explicit generation boundary. Discards parked executor results, stops
+      // any in-flight inference, and keeps the native session for the next
+      // canonical snapshot.
+      finish: async (input: any, context: any) => {
+        const id = String(input.sessionID)
+        if (closedSessions.has(id)) return { settled: true, interrupted: false, seq: 0, skipped: "closed" }
+        const session = sessionOf(id)
+        if (session.closed) return context.error("invalid_state", "session closed", { sessionID: session.id })
+        session.rejectReason = "generation finished"
+        rejectPending(session, "generation finished")
+        for (const [callID, gate] of session.gates) {
+          session.gates.delete(callID)
+          gate.reject(new Error("generation finished"))
+        }
+        for (const [callID, gate] of session.after) {
+          session.after.delete(callID)
+          session.released.add(callID)
+          gate.resolve()
+        }
+        session.decisions.clear()
+        let interrupted = false
+        const wasActive = session.promptRunning || session.activeRequest !== undefined
+        if (wasActive) {
+          try {
+            interrupted = Boolean(await ctx.session.interrupt({ sessionID: session.id }))
+          } catch {
+            // already idle or removed by teardown; the bounded wait decides
+          }
+        }
+        // Admission is not completion. Wait for the run to leave the active
+        // set; rejecting the parked executors above lets a tool-parked run end.
+        let timedOut = false
+        let waitFailed = false
+        await Promise.race([
+          ctx.session.wait({ sessionID: session.id }).catch(() => {
+            waitFailed = true
+          }),
+          new Promise<void>((resolve) => {
+            setTimeout(() => {
+              timedOut = true
+              resolve()
+            }, 10_000)
+          }),
+        ])
+        const settled = !timedOut && !waitFailed
+        session.promptRunning = false
+        session.settled = settled
+        session.running = undefined
+        session.activeRequest = undefined
+        session.outcome = undefined
+        session.primaryAssistant = undefined
+        session.authorizations.length = 0
+        session.calls.clear()
+        session.names.clear()
+        session.rejectReason = undefined
+        emit(session, "finished", { settled, interrupted })
+        return { settled, interrupted, seq: session.seq, session: describe(session) }
       },
 
       // Kept for protocol compatibility, but never authorizes JavaScript. With
@@ -1456,6 +1628,7 @@ export default Plugin.define({
         // interrupt/remove hangs.
         session.closed = true
         session.rejectReason = "session closed"
+        session.promptRunning = false
         rejectPending(session, "session closed")
         for (const [callID, gate] of session.gates) {
           session.gates.delete(callID)

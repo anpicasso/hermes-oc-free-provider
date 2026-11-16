@@ -7,11 +7,29 @@ canonical instructions and history, tool availability, approvals and tool
 effects. The binary is unmodified: there is no fork, proxy service, core patch,
 or provider-side tool execution.
 
-**Status: 4.1.0 source. The full offline suite (99 tests) passes against the
+**Status: 4.2.0 source. The full offline suite (121 tests) passes against the
 installed official OpenCode 2.3.0 binary with the core venv interpreter, an
 isolated `HERMES_HOME` and the core checkout on `PYTHONPATH`. Bounded hosted
 acceptance with the same binary passed (text plus a native `read`/Hermes
-`read_file` continuation).**
+`read_file` continuation). Real Hermes CLI acceptance also confirmed conversation
+continuity and the same native id after gateway restart/resume, plus distinct
+native ids for two delegated siblings. Cache hits were observed, not a proven
+causal performance gain.**
+
+Scoped conversations retain one official native OpenCode session and a durable
+private workspace per active profile/scope/model lane. The exact
+official-generated id is stored in a profile-scoped plugin-data SQLite mapping;
+it is never synthesised or reused as a Hermes transcript. Hermes remains the
+only history authority: every generation replaces the native snapshot, and the
+companion continues to refuse native tool execution. Missing native state
+allocates a fresh official id and reports an explicit affinity reset; transport
+errors never count as absence. Idle process eviction keeps the mapping and
+native data, while age-based retention removes inactive scopes under the same
+cross-process lock. Delegate siblings share a `sub_<sha>` cache scope, so their
+physical session id is part of the lane (compression resets delegate affinity);
+`/btw` and same-model review share the parent's lane and serialize. A per-scope
+ownership lock is held for the native runtime lifetime and released only after
+the server stops.
 
 ## Compatibility and terms
 
@@ -55,7 +73,7 @@ allow it.
 | Provider | `opencode-free` (alias `oc-free`) |
 | Provider module | `__init__.py` → `opencode_free` |
 | Vendor protocol | Chat Completions SSE inside the native OpenCode runtime |
-| Companion protocol | 4 |
+| Companion protocol | 5 |
 | Model-facing native tools | `read` only |
 | Hermes-facing streaming | none (`supports_streaming = False`; deferred, [issue #11](https://github.com/anpicasso/hermes-oc-free-provider/issues/11)) |
 | Cost policy | free models only |

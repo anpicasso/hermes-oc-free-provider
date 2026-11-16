@@ -1,7 +1,8 @@
 # Companion RPC contract
 
-Status: contract for `companion/index.ts` and the sibling runtime in 4.1.0.
-Companion id `hermes-oc-native`, protocol `4`. The official OpenCode binary is unchanged.
+Status: contract for `companion/index.ts` and the sibling runtime in the current
+source (4.2.0, protocol 5).
+Companion id `hermes-oc-native`, protocol `5`. The official OpenCode binary is unchanged.
 The companion is loaded into the official `opencode serve` process and uses
 only public plugin hooks and RPC; it never starts a process of its own. A
 mismatched protocol, companion id or binary version is refused before any model
@@ -32,10 +33,11 @@ Authorization: Basic base64("opencode:<OPENCODE_PASSWORD>")
   process and passes it only in the child environment. The server listens on
   `127.0.0.1` with an ephemeral port.
 - Every method is request/response JSON. Redirects are refused by the client.
-  `hello` and `catalog` need no session; `open` creates one; `advance`, `read`,
-  `results`/`settle`, `decide`, `state` and `close` require an existing session.
-- Methods: `hello`, `catalog`, `open`, `advance`, `read`, `results`, `decide`,
-  `state`, `close`. `settle` is accepted as a one-revision alias of `results`;
+  `hello` and `catalog` need no session; `open` creates or adopts one;
+  `advance`, `finish`, `read`, `results`/`settle`, `decide`, `state` and
+  `close` require an existing session.
+- Methods: `hello`, `catalog`, `open`, `advance`, `finish`, `read`, `results`,
+  `decide`, `state`, `close`. `settle` is accepted as a one-revision alias of `results`;
   new code uses `results`. Nothing else is an alias.
 
 Startup readiness is the runtime's stdio contract: `opencode serve` prints one
@@ -52,7 +54,7 @@ Returns:
 
 ```json
 {
-  "protocol": 4,
+  "protocol": 5,
   "companion": "hermes-oc-native",
   "binaryVersion": "2.3.0",
   "location": {"directory": "<cwd>", "project": "<canonical project>"},
@@ -121,6 +123,7 @@ companion asserts no eligibility.
 {
   "providerID": "opencode",
   "modelID": "big-pickle",
+  "sessionID": "ses_optional_existing_id",
   "hermesTools": [
     {
       "name": "write_file",
@@ -132,10 +135,15 @@ companion asserts no eligibility.
 }
 ```
 
-Returns `{"sessionID": "<id>", "location": "<cwd>", "model": "opencode/big-pickle"}`.
+Returns `{"sessionID": "<id>", "location": "<cwd>", "model": "opencode/big-pickle", "reused": false}`.
 
 - `providerID`/`modelID` are used verbatim. The runtime selects them from a
   validated catalog; the companion does not alias or repair ids.
+- `sessionID` is optional. When present, the companion calls the native
+  `session.get` API, adopts that exact existing session and returns
+  `reused: true`; it never mints, recreates or repairs an id. A missing session
+  is an `invalid_state` error. Python only sends an id it has already
+  corroborated through native `GET /api/session/<id>`.
 - `hermesTools` is optional. Names are Python-owned; Python reserves every
   current native registry id and emits a reversible alias (`hermes_<name>`) for
   a collision, so a name that still collides is refused before the session is
@@ -149,8 +157,9 @@ Returns `{"sessionID": "<id>", "location": "<cwd>", "model": "opencode/big-pickl
 - A late native tool that takes a registered Hermes name is refused at the next
   reconciliation; native names always win.
 - No session is created and no model request occurs when registration fails.
-- Up to 16 live sessions per runtime. The provider normally uses one
-  short-lived session per request, but tool registration is runtime-wide.
+- Up to 16 live sessions per runtime. A scoped affinity lane retains one
+  session across generations; unscoped requests still open/close one per
+  request. Tool registration is runtime-wide.
 
 ## `advance`
 
@@ -160,32 +169,65 @@ Returns `{"sessionID": "<id>", "location": "<cwd>", "model": "opencode/big-pickl
   "generation": 1,
   "snapshot": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
   "systemParts": ["HERMES SYSTEM TEXT"],
-  "userText": "hi"
+  "userText": "hi",
+  "hermesTools": [{"name": "read_file", "description": "…", "parameters": {"type": "object"}}]
 }
 ```
 
-Returns `{"generation": 1, "authorized": true, "session": {...state...}}`.
+Returns `{"generation": 1, "authorized": true, "seq": 42, "session": {...state...}}`.
+`seq` is the event-log position after the authorization boundary; Python moves
+its cursor there so late events from the previous generation cannot be
+attributed to this one.
 
 - `generation` must be exactly the previous generation + 1. Any other value is
   `invalid_state`.
+- A retained session accepts generation N+1 only after `finish` settled
+  generation N (`session.settled == true`). Otherwise `invalid_state` says the
+  previous generation must be finished first. A tool-parked generation is never
+  overridden by a new snapshot.
 - `snapshot` is the canonical Hermes transcript in native message shape. It
   replaces the native transcript for the one authorized request. An empty
   snapshot is refused; the companion never falls back to OpenCode's retained
   history. Maximum 512 messages / 4 MiB.
 - `systemParts` are appended to OpenCode's genuine system parts, never
   substituted. Maximum 1 MiB.
-- `userText` is the prompt anchor for the first advance. It is not injected as
-  a sentinel; the snapshot is the content.
+- `userText` is the prompt anchor for every advance. It is not injected as a
+  sentinel; the context hook replaces the transcript with the snapshot.
 - Each `advance` installs exactly one generation permit. A second permit cannot
   queue behind an unconsumed one. The `context` hook consumes the permit for
   the next primary request; a request without a permit is refused before
   vendor traffic. Exactly one primary response may bind to that permit.
-- Generation 1 is the normal request. Later advances on the same session are
-  refused in the current stock flow; the runtime opens a fresh session for each
-  model request. The code retains a release boundary for protocol
-  compatibility, but native JavaScript approval is blocked.
+- Each accepted advance issues one new native prompt. The context hook replaces
+  its messages with the canonical snapshot, so OpenCode's retained history is
+  never replayed. Native JavaScript approval remains blocked.
+- `hermesTools`, when present, is the current Hermes registry for this
+  generation. Pure additions are applied before the request; a revised/removed
+  definition while another live generation still advertises the old one is
+  `invalid_state`. An omitted list leaves registrations untouched.
 - Per-generation message/call/primary state is reset on every accepted advance.
 - `advance` on a closed session is `invalid_state`.
+
+## `finish`
+
+```json
+{"sessionID": "<id>"}
+```
+
+Returns `{"settled": true, "interrupted": false, "seq": 57, "session": {...state...}}`.
+
+- Explicit generation boundary for a retained session. It rejects every parked
+  executor/gate result, clears pending decisions, interrupts an active prompt,
+  waits up to 10 s for the run to leave the active set and keeps the native
+  session identity. No model request is made and no Hermes tool effect is
+  replayed.
+- `settled: false` means the run could not be recovered safely. The caller must
+  close/abandon that native session and let OpenCode allocate a fresh official
+  id; it must not reuse the old state.
+- `seq` lets Python advance its cursor past this generation's tail.
+- Late `prompt`/`session.wait` callbacks are generation-guarded: a rejection
+  from the previous generation is diagnostic only and cannot set
+  `promptError`/`promptRunning` on the next one.
+- Finishing a closed/tombstoned session is idempotent.
 
 ## `read`
 
@@ -250,8 +292,9 @@ runs, so there is no parked gate for `decide` to release. An explicit
 ```
 
 Returns `generation`, `running`, `pending`, `gates`, `after`, `decisions`,
-`executing`, `started`, `closed`, `promptError`, `snapshotMessages`,
-`activeRequest` and `outcome`. Diagnostic only; not an authorization.
+`executing`, `started`, `promptRunning`, `settled`, `closed`, `promptError`,
+`snapshotMessages`, `activeRequest` and `outcome`. Diagnostic only; not an
+authorization.
 
 ## `close`
 

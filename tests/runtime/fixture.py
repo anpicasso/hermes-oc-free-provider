@@ -30,6 +30,7 @@ class Fixture:
     def __init__(self, modes: list[str] | None = None, *, marker: str | None = None):
         self.modes = modes or ["text_stop"]
         self.marker = marker
+        self.delay = 0.0
         self.records: list[dict] = []
         self.lock = threading.Lock()
         self.chunk_sizes = [1, 2, 3, 5, 8, 13, 21, 34, 55]
@@ -50,6 +51,7 @@ class Fixture:
                         "path": self.path,
                         "authorization": self.headers.get("authorization"),
                         "content_type": self.headers.get("content-type"),
+                        "headers": {str(key).lower(): value for key, value in self.headers.items()},
                         "body": body,
                     }
                     fixture.records.append(record)
@@ -57,6 +59,8 @@ class Fixture:
                 if not self.path.endswith("/chat/completions"):
                     self.send_error(404)
                     return
+                if fixture.delay:
+                    time.sleep(fixture.delay)
                 mode = "text_stop" if fixture.has_tool_results(body) else fixture.modes[min(index, len(fixture.modes) - 1)]
                 payload = b"".join(fixture.sse(body, mode))
                 self.send_response(200)

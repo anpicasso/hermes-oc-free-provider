@@ -107,6 +107,36 @@ class OpenCodeFreeProfile(ProviderProfile):
         from hermes_oc_client import OpenCodeClient
         return OpenCodeClient(**kwargs)
 
+    def build_api_kwargs_extras(
+        self, *, reasoning_config=None, **context
+    ) -> tuple[dict, dict]:
+        """Carry the logical conversation scope as provider-only top-level data.
+
+        ``cache_scope_id`` is the rotation-stable compression lineage; plain
+        ``session_id`` rotates on compaction. No id (auxiliary/stateless calls)
+        emits nothing, so a generic fallback client can never receive the
+        marker as an unknown wire field.
+        """
+        del reasoning_config
+        session_id = context.get("session_id")
+        cache_scope_id = context.get("cache_scope_id")
+        if not isinstance(session_id, str):
+            session_id = ""
+        if not isinstance(cache_scope_id, str):
+            cache_scope_id = ""
+        if not session_id and not cache_scope_id:
+            return {}, {}
+        return {}, {
+            "hermes_session_context": {
+                # Both raw ids are required: `sub_` delegate siblings share a
+                # cache scope but have distinct physical sessions, while
+                # compression rotates the physical id and keeps the scope.
+                "version": 2,
+                "session_id": session_id,
+                "cache_scope_id": cache_scope_id,
+            }
+        }
+
 
     def _catalog_key(self):
         from hermes_constants import get_hermes_home

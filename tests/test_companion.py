@@ -546,7 +546,7 @@ class PackagingTests(CompanionCase):
     def test_handshake_and_live_catalog(self) -> None:
         runtime = self.runtime(PRODUCTION_COMPANION)
         hello = runtime.hello()
-        self.assertEqual(hello["protocol"], 4)
+        self.assertEqual(hello["protocol"], 5)
         self.assertEqual(hello["companion"], "hermes-oc-native")
         self.assertEqual(hello["binaryVersion"], "2.3.0")
         self.assertEqual(Path(hello["location"]["directory"]).resolve(), runtime.project.resolve())
@@ -567,9 +567,13 @@ class PackagingTests(CompanionCase):
             "native output definitions are not represented in the signature",
         )
         second_hello = runtime.hello()
+        # Official plugins may register additional tools after readiness; the
+        # already observed definitions must remain present and unchanged.
+        second_tools = {tool["id"]: tool for tool in second_hello["tools"]}
+        self.assertLessEqual(set(tools), set(second_tools))
         self.assertEqual(
-            {tool["id"]: tool["outputDefinition"] for tool in second_hello["tools"]},
-            {tool["id"]: tool["outputDefinition"] for tool in hello["tools"]},
+            {name: second_tools[name]["outputDefinition"] for name in tools},
+            {name: tool["outputDefinition"] for name, tool in tools.items()},
             "output definition signature is not stable",
         )
 
@@ -736,7 +740,18 @@ class CompletionGateTests(CompanionCase):
                     "userText": "again",
                 },
             )
-        self.assertIn("fresh session", same_session.exception.body)
+        self.assertIn("must be finished first", same_session.exception.body)
+        # The explicit boundary settles the parked executor and keeps the
+        # session; the next canonical generation is then accepted.
+        finished = runtime.rpc("finish", {"sessionID": session.session_id})["output"]
+        self.assertTrue(finished["settled"], finished)
+        fixture.plan.append({"mode": "text_stop"})
+        self.advance(session, generation=2, text="again")
+        session.wait_for(lambda event: event["type"] == "step_ended" and event.get("generation") == 2)
+        self.assertEqual(fixture.request_count, 2)
+        state = session.state()
+        self.assertIsNone(state["promptError"])
+        self.assertFalse(state["promptRunning"])
         session.close()
 
     def test_empty_snapshot_is_refused_before_prompt(self) -> None:
