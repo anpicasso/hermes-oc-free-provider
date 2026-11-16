@@ -2,6 +2,27 @@
 
 Notable changes to `oc-free-provider`.
 
+## 4.2.1 — 2026-11-16
+
+- **Companion isolation hardening.** Each runtime admits only one live session.
+  Concurrent `open` requests are serialized; capacity, duplicate/closed ids,
+  and native-session existence are checked before tool-registry mutation.
+  Rejected admission cannot replace the live session or reset its generation.
+  Close→open and retained finish→advance remain supported.
+- **Pinned profile identity.** The per-request context records the originating
+  profile home. Lazy completion refuses missing or mismatched profile identity
+  before accessing a runtime or affinity database, rather than rebinding silently.
+- **Verification.** All 126 tests pass with the official OpenCode 2.3.0 binary
+  in an isolated home; 12 admission/profile regressions were independently
+  rerun successfully. Plugin validation and doctor pass with the existing
+  private-core-import warning. This patch was tested with local fixtures, not
+  a new hosted CLI acceptance run; the real CLI continuity checks above the
+  transport were completed for 4.2.0.
+- **Scope.** These fixes address reproduced RPC admission/tool-schema cross-talk
+  and harden lazy profile binding. They do not establish absence of all leaks;
+  the unconfirmed late lifecycle-event race remains outside this patch.
+  Native Windows/macOS execution remains unverified.
+
 ## 4.2.0 — 2026-11-16
 
 - **Session/cache affinity.** Scoped conversations retain one exact
@@ -20,8 +41,8 @@ Notable changes to `oc-free-provider`.
   `advance` accepts generation N+1 after the new explicit `finish` boundary,
   carries the current Hermes tool registry, and returns the event cursor
   boundary. `finish` rejects parked executor results, interrupts/wait-settles a
-  live prompt and keeps the native session. Late events from a previous
-  generation can no longer be attributed to the next one.
+  live prompt and keeps the native session. Late prompt/wait rejection
+  callbacks are generation-guarded so they cannot mutate the next generation.
 - **Recovery and isolation.** Native `GET /api/session/<id>` corroborates the
   stored id and workspace before reuse. Only a real 404 resets affinity; fresh
   allocation replaces the mapping and sets `Completion.affinity_reset`.

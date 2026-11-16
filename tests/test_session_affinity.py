@@ -61,6 +61,7 @@ def _context(session_id: str, cache_scope_id: str | None = None) -> dict:
         "version": 2,
         "session_id": session_id,
         "cache_scope_id": session_id if cache_scope_id is None else cache_scope_id,
+        "profile_home": str(HOME),
     }
 
 
@@ -97,11 +98,19 @@ class SeamTests(unittest.TestCase):
         profile = _plugin().opencode_free
         self.assertEqual(profile.build_api_kwargs_extras(), ({}, {}))
         _, top = profile.build_api_kwargs_extras(session_id="session-one")
-        self.assertEqual(top["hermes_session_context"],
-                         {"version": 2, "session_id": "session-one", "cache_scope_id": ""})
+        self.assertEqual(
+            top["hermes_session_context"],
+            {
+                "version": 2,
+                "session_id": "session-one",
+                "cache_scope_id": "",
+                "profile_home": str(HOME),
+            },
+        )
         _, top = profile.build_api_kwargs_extras(session_id="rotated", cache_scope_id="lineage-root")
         self.assertEqual(top["hermes_session_context"]["session_id"], "rotated")
         self.assertEqual(top["hermes_session_context"]["cache_scope_id"], "lineage-root")
+        self.assertEqual(top["hermes_session_context"]["profile_home"], str(HOME))
         self.assertEqual(profile.build_api_kwargs_extras(session_id=""), ({}, {}))
 
     def test_real_aiagent_builder_publishes_marker_and_aux_never_sees_it(self) -> None:
@@ -119,6 +128,11 @@ class SeamTests(unittest.TestCase):
             self.assertEqual(marker["version"], 2)
             self.assertEqual(marker["session_id"], "seam-session-1")
             self.assertEqual(marker["cache_scope_id"], "seam-session-1")
+            self.assertEqual(marker["profile_home"], str(HOME))
+            client = agent.client
+            assert client is not None
+            scope = client._session_scope(marker)
+            self.assertEqual(scope["profile_home"], str(HOME))
             self.assertNotIn("hermes_session_context", kwargs.get("extra_body") or {})
             self.assertNotIn("hermes_session_context", (kwargs.get("messages") or [{}])[0])
         finally:
@@ -127,6 +141,41 @@ class SeamTests(unittest.TestCase):
             "opencode-free", "opencode-free", "nonce", "opencode-native://local", None, frozenset()
         )
         self.assertNotIn("hermes_session_context", projection.top_level)
+
+    def test_profile_switch_is_refused_at_lazy_evaluation_before_runtime_or_db(self) -> None:
+        profile = _plugin().opencode_free
+        _, top = profile.build_api_kwargs_extras(session_id="pinned-session")
+        marker = top["hermes_session_context"]
+        client = OpenCodeClient(model="nonce")
+        try:
+            with mock.patch.object(
+                client, "_ensure_runtime", side_effect=AssertionError("runtime was touched")
+            ), mock.patch(
+                "oc_affinity.native_root", side_effect=AssertionError("affinity db was touched")
+            ):
+                lazy = client.create_lazy(
+                    messages=[{"role": "user", "content": "hi"}],
+                    model="nonce",
+                    hermes_session_context=marker,
+                )
+                from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+                token = set_hermes_home_override(str(HOME / "other-profile"))
+                try:
+                    with self.assertRaises(ControlRefused) as caught:
+                        lazy.text
+                finally:
+                    reset_hermes_home_override(token)
+            self.assertIn("different Hermes profile", str(caught.exception))
+        finally:
+            client.close()
+
+    def test_scoped_marker_without_pinned_profile_is_refused(self) -> None:
+        with self.assertRaises(ControlRefused) as caught:
+            OpenCodeClient._session_scope(
+                {"version": 2, "session_id": "unpinned", "cache_scope_id": "unpinned"}
+            )
+        self.assertIn("profile_home", str(caught.exception))
 
     def test_delegate_siblings_separate_while_compression_and_gateway_stay(self) -> None:
         agent = AIAgent(

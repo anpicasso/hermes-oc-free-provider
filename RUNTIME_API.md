@@ -224,8 +224,9 @@ companion never executes a Hermes tool.
   `plugins.plugin_storage.plugin_db("oc-free-provider")`: schema version, local
   scope key, exact official native id, native provider/model and last-used.
   Hermes' main session database is never opened or modified.
-- The profile sends both raw ids (`session_id`, `cache_scope_id`) in
-  `hermes_session_context`; the client derives the local lane:
+- The profile sends both raw ids (`session_id`, `cache_scope_id`) and its
+  pinned `profile_home` in `hermes_session_context`; the client derives the
+  local lane:
   - normal/compression/`/branch`/gateway: `cache_scope_id` (stable across
     compression rotation and per-response gateway ids);
   - `sub_<sha>` delegate scopes: `sub:<scope>:<session_id>`, because delegate
@@ -235,8 +236,11 @@ companion never executes a Hermes tool.
     share one lane and are serialized (a concurrent call gets busy);
   - missing `session_id` on a `sub_` scope or both ids absent stays ephemeral,
     never a shared anonymous bucket.
-  The local key is a SHA-256 of `(profile home, lane, provider, model)`. It is
-  never a wire id.
+  The client validates the pinned profile against the active profile before any
+  runtime or affinity-database access. A marker built under one profile and
+  resolved under another is refused; it is never silently rebound. The local
+  key is a SHA-256 of `(profile home, lane, provider, model)`. It is never a
+  wire id.
 - First use calls native create without an id, then persists the exact returned
   id. Reuse verifies it with native `GET /api/session/<id>` (id and workspace).
   Only a real 404 resets affinity: allocate a fresh official id, replace the

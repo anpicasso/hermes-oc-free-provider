@@ -159,13 +159,15 @@ class CompanionRevisionCase(unittest.TestCase):
         self.assertEqual(result.finish, "stop")
         second.close()
 
-    def test_revision_rejected_while_live_generation_advertises_old(self) -> None:
+    def test_open_while_live_cannot_mutate_registry(self) -> None:
         runtime = self.runtime(self.fixture(["text_stop"]))
         first = runtime.new_session("opencode", "nonce", [WRITE_FILE])
         first.advance(snapshot=USER_SNAPSHOT, system_parts=[], user_text="go", timeout=60)
+        before = self.definition(runtime, "write_file")
         with self.assertRaises(SessionRefused) as caught:
             runtime.new_session("opencode", "nonce", [revised_write_file("Write content v2.")])
-        self.assertIn("live generation", str(caught.exception))
+        self.assertIn("live session limit 1", str(caught.exception))
+        self.assertEqual(self.definition(runtime, "write_file"), before)
         first.close()
 
         second = runtime.new_session("opencode", "nonce", [revised_write_file("Write content v2.")])
@@ -187,16 +189,19 @@ class CompanionRevisionCase(unittest.TestCase):
         self.assertEqual(result.finish, "stop")
         second.close()
 
-    def test_stale_tool_rejected_while_live_generation_advertises_it(self) -> None:
+    def test_stale_tool_cannot_be_removed_while_live(self) -> None:
         runtime = self.runtime(self.fixture(["text_stop"]))
         first = runtime.new_session("opencode", "nonce", [WRITE_FILE, AUX_TOOL])
         first.advance(snapshot=USER_SNAPSHOT, system_parts=[], user_text="go", timeout=60)
         with self.assertRaises(SessionRefused) as caught:
             runtime.new_session("opencode", "nonce", [WRITE_FILE])
-        self.assertIn("aux_tool", str(caught.exception))
+        self.assertIn("live session limit 1", str(caught.exception))
+        self.assertIn("aux_tool", self.tool_names(runtime))
         first.close()
 
-        runtime.new_session("opencode", "nonce", [WRITE_FILE]).close()
+        second = runtime.new_session("opencode", "nonce", [WRITE_FILE])
+        self.assertNotIn("aux_tool", self.tool_names(runtime))
+        second.close()
 
     # -- SSE framing --------------------------------------------------------
     def test_large_burst_is_chunking_independent(self) -> None:

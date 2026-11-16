@@ -611,6 +611,29 @@ class OpenCodeClient:
                 )
         if not session_id and not cache_scope_id:
             return None
+        profile_home = context.get("profile_home") or ""
+        if (
+            not isinstance(profile_home, str)
+            or not profile_home
+            or len(profile_home) > 4096
+            or "\x00" in profile_home
+        ):
+            raise ControlRefused(
+                "hermes_session_context.profile_home must pin a bounded Hermes profile"
+            )
+        # The marker was built where the request was created. Refuse to resolve
+        # it under a different active profile before any runtime or affinity
+        # database access; a late evaluation must never silently rebind.
+        current_home = _authoritative_profile_home()
+        if not current_home:
+            raise ControlRefused(
+                "hermes_session_context cannot be resolved without an active Hermes profile"
+            )
+        if os.path.realpath(profile_home) != os.path.realpath(current_home):
+            raise ControlRefused(
+                "hermes_session_context was built for a different Hermes profile; "
+                "refusing a cross-profile request"
+            )
         if cache_scope_id.startswith("sub_"):
             # Delegate siblings share one sub_<sha> cache bucket. The physical
             # session is the only sibling-unique value; compression rotates it,
@@ -622,10 +645,6 @@ class OpenCodeClient:
             # Normal/compression/gateway/branch: the scope is stable across
             # physical-id rotation and per-response gateway ids.
             lane = cache_scope_id or session_id
-        profile_home = _authoritative_profile_home()
-        if not profile_home:
-            # No profile identity means no safe shared bucket. Stay ephemeral.
-            return None
         return {
             "lane": lane,
             "session_id": session_id,

@@ -7,7 +7,7 @@ canonical instructions and history, tool availability, approvals and tool
 effects. The binary is unmodified: there is no fork, proxy service, core patch,
 or provider-side tool execution.
 
-**Status: 4.2.0 source. The full offline suite (121 tests) passes against the
+**Status: 4.2.0 source. The full offline suite (126 tests) passes against the
 installed official OpenCode 2.3.0 binary with the core venv interpreter, an
 isolated `HERMES_HOME` and the core checkout on `PYTHONPATH`. Bounded hosted
 acceptance with the same binary passed (text plus a native `read`/Hermes
@@ -19,7 +19,10 @@ causal performance gain.**
 Scoped conversations retain one official native OpenCode session and a durable
 private workspace per active profile/scope/model lane. The exact
 official-generated id is stored in a profile-scoped plugin-data SQLite mapping;
-it is never synthesised or reused as a Hermes transcript. Hermes remains the
+it is never synthesised or reused as a Hermes transcript. Each private runtime
+admits one live companion session at a time, and each request marker pins the
+Hermes profile that built it: resolving it under another profile is refused
+before any runtime or affinity-storage access. Hermes remains the
 only history authority: every generation replaces the native snapshot, and the
 companion continues to refuse native tool execution. Missing native state
 allocates a fresh official id and reports an explicit affinity reset; transport

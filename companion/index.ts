@@ -51,7 +51,10 @@ const MAX_HERMES_TOOLS = 256
 const MAX_PENDING = 64
 const MAX_RESULTS = 64
 const MAX_NESTED_CALLS = 32
-const MAX_LIVE_SESSIONS = 16
+// The companion owns exactly one live session per official runtime. The tool
+// registry is process-wide, so a second live session would advertise another
+// caller's Hermes schemas on its next request.
+const MAX_LIVE_SESSIONS = 1
 const CLOSED_TOMBSTONES = 128
 // One message for every JavaScript request: the model gets an actionable
 // refusal and Hermes never receives JS as a Python program.
@@ -143,6 +146,18 @@ const closedSessions = new Map<string, { seq: number }>()
 const forwarded = new Set<string>()
 const hermesDefinitions = new Map<string, string>()
 let requestSeq = 0
+// `open` awaits native session creation and tool registration. Admission is
+// serialized across those gaps so two concurrent callers cannot both observe
+// an empty slot and install two live sessions (the registry is runtime-wide).
+let openAdmission: Promise<unknown> = Promise.resolve()
+const admitOpen = <T>(work: () => Promise<T>): Promise<T> => {
+  const result = openAdmission.then(work)
+  openAdmission = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
+}
 
 // Stable, depth-bounded JSON projection for schema objects. Effect Schema
 // instances are class objects with circular references; a plain JSON.stringify
@@ -883,9 +898,10 @@ export default Plugin.define({
       const stale = Array.from(hermesDefinitions.keys()).filter((name) => !desired.has(name))
       if (pending.length === 0 && revised.length === 0 && stale.length === 0) return
       // A live session registered the previous registry when it opened. Never
-      // swap a definition or remove a tool under it; the next `open` after all
-      // sessions close may revise. Pure additions do not change an existing
-      // definition and stay allowed.
+      // swap a definition or remove a tool under a different live session; the
+      // next `open` after the one live slot closes may revise. `advance` passes
+      // its own id as `exceptSessionID`, so its next generation may update the
+      // definitions it will advertise. Pure additions stay allowed.
       const live = Array.from(sessions.values()).filter(
         (session) => !session.closed && session.id !== exceptSessionID,
       )
@@ -1291,84 +1307,113 @@ export default Plugin.define({
         }
       },
 
-      open: async (input: any, context: any) => {
-        const providerID = String(input.providerID)
-        const modelID = String(input.modelID)
-        if (!providerID || !modelID)
-          return context.error("invalid_state", "providerID and modelID are required", {})
-        try {
-          // Exact current catalog: undefined/empty removes prior Hermes
-          // registrations so a disabled tool cannot remain callable.
-          await registerHermesTools(Array.isArray(input.hermesTools) ? input.hermesTools : [])
-        } catch (error) {
-          return context.error("invalid_state", String((error as Error)?.message ?? error), {})
-        }
-        if (sessions.size >= MAX_LIVE_SESSIONS)
-          return context.error("invalid_state", `live session limit ${MAX_LIVE_SESSIONS} reached`, {
-            sessions: sessions.size,
-          })
-        // Reuse only an exact native ID allocated by OpenCode on an earlier
-        // run. A missing ID is reported; the caller allocates a fresh official
-        // one and replaces its mapping (never recreate an invented id).
-        let info: any
-        const requested = typeof input.sessionID === "string" && input.sessionID ? input.sessionID : undefined
-        if (requested) {
-          try {
-            const existing: any = await ctx.session.get({ sessionID: requested })
-            info = existing?.data ?? existing
-          } catch (error) {
-            return context.error("invalid_state", `native session ${requested} no longer exists`, {
-              sessionID: requested,
-              missing: true,
+      open: async (input: any, context: any) =>
+        admitOpen(async () => {
+          const providerID = String(input.providerID)
+          const modelID = String(input.modelID)
+          if (!providerID || !modelID)
+            return context.error("invalid_state", "providerID and modelID are required", {})
+          const requested =
+            typeof input.sessionID === "string" && input.sessionID ? input.sessionID : undefined
+          // Admission and native-id validation finish before the runtime-wide
+          // tool registry is touched: a refused open must not leave a ghost
+          // definition or replace the one live session.
+          if (requested && sessions.has(requested))
+            return context.error(
+              "invalid_state",
+              `session ${requested} is already open in this runtime; close it first`,
+              { sessionID: requested },
+            )
+          if (requested && closedSessions.has(requested))
+            return context.error(
+              "invalid_state",
+              `session ${requested} was closed in this runtime; allocate a new native session`,
+              { sessionID: requested, closed: true },
+            )
+          if (sessions.size >= MAX_LIVE_SESSIONS)
+            return context.error("invalid_state", `live session limit ${MAX_LIVE_SESSIONS} reached`, {
+              sessions: sessions.size,
             })
+          // Reuse only an exact native ID allocated by OpenCode on an earlier
+          // run. A missing ID is reported; the caller allocates a fresh official
+          // one and replaces its mapping (never recreate an invented id).
+          let info: any
+          let createdNative = false
+          if (requested) {
+            try {
+              const existing: any = await ctx.session.get({ sessionID: requested })
+              info = existing?.data ?? existing
+            } catch (error) {
+              return context.error("invalid_state", `native session ${requested} no longer exists`, {
+                sessionID: requested,
+                missing: true,
+              })
+            }
+            if (!info || String(info.id ?? info.sessionID ?? "") !== requested)
+              return context.error("invalid_state", `native session ${requested} returned a different id`, {
+                sessionID: requested,
+                missing: true,
+              })
+          } else {
+            const created: any = await ctx.session.create({
+              location: { directory: ctx.location.directory },
+              model: { providerID, id: modelID },
+            })
+            info = created?.data ?? created
+            createdNative = true
           }
-          if (!info || String(info.id ?? info.sessionID ?? "") !== requested)
-            return context.error("invalid_state", `native session ${requested} returned a different id`, {
-              sessionID: requested,
-              missing: true,
-            })
-        } else {
-          const created: any = await ctx.session.create({
-            location: { directory: ctx.location.directory },
-            model: { providerID, id: modelID },
-          })
-          info = created?.data ?? created
-        }
-        const session: Session = {
-          id: String(info.id ?? info.sessionID),
-          generation: 0,
-          authorizations: [],
-          running: undefined,
-          userText: undefined,
-          started: false,
-          promptRunning: false,
-          settled: true,
-          closed: false,
-          snapshot: [],
-          systemParts: [],
-          gates: new Map(),
-          after: new Map(),
-          released: new Set(),
-          executing: new Set(),
-          decisions: new Map(),
-          childSeq: 0,
-          pending: new Map(),
-          calls: new Map(),
-          names: new Map(),
-          stepGeneration: new Map(),
-          events: [],
-          seq: 0,
-          waiters: new Set(),
-        }
-        sessions.set(session.id, session)
-        emit(session, "opened", { model: `${providerID}/${modelID}`, reused: Boolean(requested) })
-        return {
-          sessionID: session.id,
-          location: ctx.location.directory,
-          model: `${providerID}/${modelID}`,
-          reused: Boolean(requested),
-        }
-      },
+          try {
+            // Exact current catalog: undefined/empty removes prior Hermes
+            // registrations so a disabled tool cannot remain callable.
+            await registerHermesTools(Array.isArray(input.hermesTools) ? input.hermesTools : [])
+          } catch (error) {
+            if (createdNative) {
+              // A failed admission must not leave the freshly created native
+              // session behind; tool definitions are validated before they are
+              // applied, so a refused registration does not add one.
+              try {
+                await ctx.session.remove({ sessionID: String(info?.id ?? info?.sessionID ?? "") })
+              } catch {
+                // Best effort: no companion session is admitted either way.
+              }
+            }
+            return context.error("invalid_state", String((error as Error)?.message ?? error), {})
+          }
+          const session: Session = {
+            id: String(info.id ?? info.sessionID),
+            generation: 0,
+            authorizations: [],
+            running: undefined,
+            userText: undefined,
+            started: false,
+            promptRunning: false,
+            settled: true,
+            closed: false,
+            snapshot: [],
+            systemParts: [],
+            gates: new Map(),
+            after: new Map(),
+            released: new Set(),
+            executing: new Set(),
+            decisions: new Map(),
+            childSeq: 0,
+            pending: new Map(),
+            calls: new Map(),
+            names: new Map(),
+            stepGeneration: new Map(),
+            events: [],
+            seq: 0,
+            waiters: new Set(),
+          }
+          sessions.set(session.id, session)
+          emit(session, "opened", { model: `${providerID}/${modelID}`, reused: Boolean(requested) })
+          return {
+            sessionID: session.id,
+            location: ctx.location.directory,
+            model: `${providerID}/${modelID}`,
+            reused: Boolean(requested),
+          }
+        }),
 
       advance: async (input: any, context: any) => {
         const id = String(input.sessionID)

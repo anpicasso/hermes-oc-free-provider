@@ -616,7 +616,7 @@ class PackagingTests(CompanionCase):
         self.assertEqual(nonce["limit"], {"context": 32000, "output": 4096})
 
 
-    def test_closed_sessions_are_evicted_and_live_sessions_are_bounded(self) -> None:
+    def test_closed_sessions_are_evicted_and_only_one_live_session_is_admitted(self) -> None:
         fixture = self.fixture()
         runtime = self.runtime(TEST_COMPANION, fixture)
         ids = []
@@ -634,13 +634,19 @@ class PackagingTests(CompanionCase):
             self.advance(closed)
         self.assertIn("session closed", refused.exception.body)
 
-        live = [self.open(runtime) for _ in range(16)]
+        live = self.open(runtime)
+        self.assertEqual(runtime.hello()["sessions"], 1)
         with self.assertRaises(RpcFailure) as capped:
             self.open(runtime)
-        self.assertIn("live session limit", capped.exception.body)
-        for session in live:
-            session.close()
+        self.assertIn("live session limit 1", capped.exception.body)
+        self.assertEqual(runtime.hello()["sessions"], 1)
+        self.assertEqual(live.state()["generation"], 0)
+        live.close()
         self.assertEqual(runtime.hello()["sessions"], 0)
+        # The single slot is immediately reusable after an explicit close.
+        reopened = self.open(runtime)
+        self.assertEqual(reopened.state()["generation"], 0)
+        reopened.close()
 
 
 class RegistryTests(CompanionCase):
@@ -694,18 +700,129 @@ class RegistryTests(CompanionCase):
         self.assertEqual(caught.exception.status, 400)
         self.assertIn("collide", caught.exception.body)
         self.assertEqual(fixture.request_count, 0)
+        self.assertEqual(runtime.hello()["sessions"], 0)
+        # A registration failure releases the slot and leaves no ghost tool.
+        recovered = self.open(runtime)
+        recovered.close()
+        self.assertEqual(runtime.hello()["sessions"], 0)
 
-    def test_changed_hermes_definition_is_refused(self) -> None:
+    def test_simultaneous_opens_admit_exactly_one(self) -> None:
+        fixture = self.fixture()
+        runtime = self.runtime(TEST_COMPANION, fixture)
+        count = 8
+        barrier = threading.Barrier(count)
+        outcomes: list[tuple[bool, str]] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                output = runtime.rpc("open", {"providerID": "opencode", "modelID": "nonce"})["output"]
+                with lock:
+                    outcomes.append((True, str(output["sessionID"])))
+            except RpcFailure as error:
+                with lock:
+                    outcomes.append((False, error.body))
+
+        threads = [threading.Thread(target=worker) for _ in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(outcomes), count, outcomes)
+        winners = [session_id for ok, session_id in outcomes if ok]
+        refused = [body for ok, body in outcomes if not ok]
+        self.assertEqual(len(winners), 1, outcomes)
+        self.assertEqual(len(refused), count - 1, outcomes)
+        for body in refused:
+            self.assertIn("live session limit 1", body)
+        self.assertEqual(runtime.hello()["sessions"], 1)
+        winner = Session(runtime, winners[0])
+        winner.close()
+        reopened = self.open(runtime)
+        reopened.close()
+
+    def test_rejected_admissions_leave_live_session_and_registry_unchanged(self) -> None:
+        fixture = self.fixture()
+        fixture.plan.append({"mode": "text_stop"})
+        runtime = self.runtime(TEST_COMPANION, fixture)
+        ghost = {
+            "name": "ghost_tenant_tool",
+            "description": "must not survive a refused open",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        session = self.open(runtime)
+        self.advance(session)
+        session.until(lambda event: event["type"] == "step_ended")
+        self.assertEqual(session.state()["generation"], 1)
+        with self.assertRaises(RpcFailure) as duplicate:
+            runtime.rpc(
+                "open",
+                {
+                    "providerID": "opencode",
+                    "modelID": "nonce",
+                    "sessionID": session.session_id,
+                    "hermesTools": [ghost],
+                },
+            )
+        self.assertIn("already open", duplicate.exception.body)
+        with self.assertRaises(RpcFailure) as capped:
+            runtime.rpc("open", {"providerID": "opencode", "modelID": "nonce", "hermesTools": [ghost]})
+        self.assertIn("live session limit 1", capped.exception.body)
+        self.assertEqual(session.state()["generation"], 1)
+        self.assertEqual(runtime.hello()["sessions"], 1)
+        self.assertNotIn("ghost_tenant_tool", {tool["id"] for tool in runtime.hello()["tools"]})
+        # The retained session still crosses finish -> advance normally.
+        finished = runtime.rpc("finish", {"sessionID": session.session_id})["output"]
+        self.assertTrue(finished["settled"], finished)
+        fixture.plan.append({"mode": "text_stop"})
+        self.advance(session, generation=2, text="next")
+        session.wait_for(lambda event: event["type"] == "step_ended" and event.get("generation") == 2)
+        session.close()
+
+    def test_missing_native_id_open_leaves_registry_unchanged(self) -> None:
+        fixture = self.fixture()
+        runtime = self.runtime(TEST_COMPANION, fixture)
+        ghost = {
+            "name": "ghost_tenant_tool",
+            "description": "must not survive a refused open",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        with self.assertRaises(RpcFailure) as missing:
+            runtime.rpc(
+                "open",
+                {
+                    "providerID": "opencode",
+                    "modelID": "nonce",
+                    "sessionID": "ses_missing_native_000000",
+                    "hermesTools": [ghost],
+                },
+            )
+        self.assertIn("no longer exists", missing.exception.body)
+        self.assertEqual(runtime.hello()["sessions"], 0)
+        self.assertNotIn("ghost_tenant_tool", {tool["id"] for tool in runtime.hello()["tools"]})
+
+    def test_open_while_live_is_refused_before_registry_mutation(self) -> None:
         fixture = self.fixture()
         runtime = self.runtime(TEST_COMPANION, fixture)
         first = self.open(runtime, [WRITE_FILE_TOOL])
+        before = {tool["id"]: tool["definition"] for tool in runtime.hello()["tools"]}
         changed = json.loads(json.dumps(WRITE_FILE_TOOL))
         changed["parameters"]["properties"]["mode"] = {"type": "string"}
         with self.assertRaises(RpcFailure) as caught:
             runtime.rpc("open", {"providerID": "opencode", "modelID": "nonce", "hermesTools": [changed]})
-        self.assertIn("definition changed", caught.exception.body)
+        self.assertIn("live session limit 1", caught.exception.body)
+        after = {tool["id"]: tool["definition"] for tool in runtime.hello()["tools"]}
+        self.assertEqual(after["write_file"], before["write_file"])
+        self.assertEqual(first.state()["generation"], 0)
         self.assertEqual(fixture.request_count, 0)
         first.close()
+
+        # A revision is admitted only after the one live slot is released.
+        revised = self.open(runtime, [changed])
+        registered = {tool["id"]: tool["definition"] for tool in runtime.hello()["tools"]}
+        self.assertNotEqual(registered["write_file"], before["write_file"])
+        revised.close()
 
 
 class CompletionGateTests(CompanionCase):

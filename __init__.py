@@ -113,9 +113,11 @@ class OpenCodeFreeProfile(ProviderProfile):
         """Carry the logical conversation scope as provider-only top-level data.
 
         ``cache_scope_id`` is the rotation-stable compression lineage; plain
-        ``session_id`` rotates on compaction. No id (auxiliary/stateless calls)
-        emits nothing, so a generic fallback client can never receive the
-        marker as an unknown wire field.
+        ``session_id`` rotates on compaction. The active profile home is pinned
+        in the marker so a lazy completion cannot silently rebind to a profile
+        it was not built for. No id (auxiliary/stateless calls) emits nothing,
+        so a generic fallback client can never receive the marker as an unknown
+        wire field.
         """
         del reasoning_config
         session_id = context.get("session_id")
@@ -126,6 +128,8 @@ class OpenCodeFreeProfile(ProviderProfile):
             cache_scope_id = ""
         if not session_id and not cache_scope_id:
             return {}, {}
+        from hermes_constants import get_hermes_home
+
         return {}, {
             "hermes_session_context": {
                 # Both raw ids are required: `sub_` delegate siblings share a
@@ -134,6 +138,9 @@ class OpenCodeFreeProfile(ProviderProfile):
                 "version": 2,
                 "session_id": session_id,
                 "cache_scope_id": cache_scope_id,
+                # Captured where the request is built; the client refuses to
+                # resolve it under any other profile.
+                "profile_home": str(get_hermes_home()),
             }
         }
 

@@ -151,13 +151,20 @@ Returns `{"sessionID": "<id>", "location": "<cwd>", "model": "opencode/big-pickl
   Omitted/empty means no Hermes tools, and registrations from an earlier
   generation are removed when no live session blocks the change.
 - An identical definition is idempotent. A changed definition or removal is
-  applied only between generations: while any live session advertises the
-  previous registry, `open` refuses with `invalid_state` naming the affected
-  tools. Pure additions are allowed alongside a live session.
+  applied only between generations, when no other live session advertises the
+  previous registry. With the single-live-session contract, revisions happen
+  after `close`; `advance` may still update the registry for its own next
+  generation.
+- Admission is serialized and checked before the runtime-wide registry is
+  touched: one live session per runtime, no duplicate live `sessionID`, and an
+  adopted native id must already exist and match exactly. A refused `open`
+  leaves the existing session, its generation and the registered definitions
+  unchanged.
 - A late native tool that takes a registered Hermes name is refused at the next
   reconciliation; native names always win.
-- No session is created and no model request occurs when registration fails.
-- Up to 16 live sessions per runtime. A scoped affinity lane retains one
+- No live session is admitted and no model request occurs when registration
+  fails; a freshly created native session is removed again.
+- Exactly one live session per runtime. A scoped affinity lane retains one
   session across generations; unscoped requests still open/close one per
   request. Tool registration is runtime-wide.
 
@@ -202,8 +209,8 @@ attributed to this one.
   never replayed. Native JavaScript approval remains blocked.
 - `hermesTools`, when present, is the current Hermes registry for this
   generation. Pure additions are applied before the request; a revised/removed
-  definition while another live generation still advertises the old one is
-  `invalid_state`. An omitted list leaves registrations untouched.
+  definition is applied only when no other live session advertises the old one.
+  An omitted list leaves registrations untouched.
 - Per-generation message/call/primary state is reset on every accepted advance.
 - `advance` on a closed session is `invalid_state`.
 
@@ -375,6 +382,10 @@ usage is a rejection, never zero and never `null`-as-success.
 6. A tool advertised to the model without a wrapped executor is refused before
    inference. A call to any tool outside the exposed set is refused in
    `execute.before`, whether or not the model saw it.
+7. `open` admission is serialized for the whole create/adopt/register sequence
+   and enforces one live session per runtime. Capacity, duplicate-id and
+   native-id checks complete before any registry mutation, so a refused open
+   cannot add a definition or replace a live generation.
 
 ## Native JavaScript refusal
 
@@ -401,7 +412,7 @@ usage is a rejection, never zero and never `null`-as-success.
 - Snapshot: 512 messages / 4 MiB; system parts: 1 MiB.
 - Hermes tool definitions: 256 per runtime; parameters must be JSON objects.
 - Pending nested executors: 64 per session; result batches: 64 entries.
-- Live sessions: 16 per runtime; closed tombstones: 128 ids.
+- Live sessions: 1 per runtime (admission serialized); closed tombstones: 128 ids.
 - Nested calls: 32 per program; child ids are `<parentCallID>#<n>` and are
   never reused.
 
