@@ -1,10 +1,17 @@
 manifest_version: 1
 name: oc-free-provider
 kind: model-provider
-version: 4.0.0
+version: 4.1.0
 requires_hermes: ">=0.23.1"
-description: Unofficial OpenCode free-model transport (Bun) with Hermes-local tools
-author: Hermes community
+description: Official OpenCode runtime plus companion with Hermes-controlled tool effects
 homepage: https://github.com/anpicasso/hermes-oc-free-provider
+author: Angello Picasso
 license: MIT
 tags: [opencode, inference, model-provider, free-models]
+config_schema:
+  binary_path:
+    type: str
+    label: OpenCode binary path
+    description: >-
+      Absolute path to an official `opencode` >= 2.3.0 executable. Only needed
+      when no usable `opencode` is on the Hermes process PATH.

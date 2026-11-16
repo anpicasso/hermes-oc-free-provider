@@ -1,187 +1,279 @@
 # oc-free-provider
 
-An unofficial Hermes model-provider for OpenCode Zen free models. Hermes keeps
-control of the agent loop and executes tools locally; the provider only handles
-model discovery and inference transport.
+Native [OpenCode](https://github.com/anomalyco/opencode) inference through
+Hermes's public model-provider API. The provider owns a private official
+OpenCode process and a bundled companion that runs inside it. Hermes keeps
+canonical instructions and history, tool availability, approvals and tool
+effects. The binary is unmodified: there is no fork, proxy service, core patch,
+or provider-side tool execution.
 
-It does **not** run `opencode serve`, ACP, or a tool-execution proxy.
+**Status: 4.1.0 source. The full offline suite (99 tests) passes against the
+installed official OpenCode 2.3.0 binary with the core venv interpreter, an
+isolated `HERMES_HOME` and the core checkout on `PYTHONPATH`. Bounded hosted
+acceptance with the same binary passed (text plus a native `read`/Hermes
+`read_file` continuation).**
 
-## Compatibility and terms notice
+## Compatibility and terms
 
 This project is independent, unofficial, and not affiliated with or endorsed by
-OpenCode. It is intended for a user's own internal use on systems they control.
-It does not grant access to OpenCode Zen or any model, and it is not legal
-advice.
+OpenCode. It does not grant access to OpenCode Zen or any model, and it is not
+legal advice. It also does not claim that OpenCode approves or documents this
+integration.
 
-OpenCode's [Zen documentation](https://opencode.ai/docs/zen/) describes Zen as
-usable with other coding agents. That general interoperability statement is not
-an authorization for every client, authentication method, workload, or use
-case. This plugin's current public compatibility transport is not documented by
-OpenCode as a supported Hermes integration and may be changed or disabled at
-any time.
+The provider launches the official, unmodified `opencode` executable and loads
+a companion into that process through public hooks. It does not patch the
+binary, reproduce its TLS stack, or run a separate inference proxy. Using the
+official binary is not an endorsement or permission from OpenCode for hosted
+use, and it does not guarantee free-model availability. The current OpenCode
+and model-provider terms govern your use.
 
-As of November 2026 the upstream contract explicitly excludes this transport:
-OpenCode's Console documentation states that free-tier chat models are only
-available from within OpenCode, and the gateway enforces that by answering
-anything that does not look like the OpenCode client with HTTP 429
-`FreeUsageLimitError`. The check is not a quota, a key, or a header set: it is
-the request's client identity, down to the TLS stack.
+The unmodified binary composes its own request context. That can include a
+system preamble describing the working directory, git status and OS details,
+and it follows the binary's own outbound HTTP policy. The provider runs the
+binary in an isolated workspace with a small environment allowlist
+(`PATH`, locale, TLS certificate paths and platform loader variables) plus a
+fresh per-process `OPENCODE_PASSWORD`; it refuses redirects on its own loopback
+RPC. It does not intercept, rewrite or proxy the binary's upstream traffic.
 
-This plugin gets around that check by reproducing the official client's request
-— its sortable session id, its `<env>` system preamble, its `stream: true` tool
-call shape, and its Bun TLS stack. That is deliberate client impersonation. It
-is not a documented integration, it may stop working without notice, and whoever
-runs it does so on their own judgement and responsibility. The supported paths
-remain Hermes' built-in `opencode-zen` and `opencode-go` providers.
+Before using the plugin, review and independently comply with the current
+[OpenCode Terms of Service](https://opencode.ai/legal/terms-of-service), the
+[OpenCode Zen documentation](https://opencode.ai/docs/zen/), and the terms,
+privacy notices and acceptable-use rules for the selected model. Use the
+service only when you have the right to access it. Do not use this project to
+provide inference for third parties, resell or proxy the service, scrape or
+bulk-extract outputs, evade quotas or rate limits, rotate accounts or identities
+for additional free usage, conceal prohibited activity, or bypass an access
+restriction. Free-model labels describe pricing, not permission or privacy;
+never send secrets or regulated data unless the applicable terms expressly
+allow it.
 
-Before using the plugin, review and independently comply with the current:
+## Identity
 
-- [OpenCode Terms of Service](https://opencode.ai/legal/terms-of-service)
-- [OpenCode Zen documentation](https://opencode.ai/docs/zen/)
-- terms, privacy notices, and acceptable-use rules for the selected model
+| Item | Value |
+|---|---|
+| Plugin | `oc-free-provider` (`model-provider`) |
+| Provider | `opencode-free` (alias `oc-free`) |
+| Provider module | `__init__.py` → `opencode_free` |
+| Vendor protocol | Chat Completions SSE inside the native OpenCode runtime |
+| Companion protocol | 4 |
+| Model-facing native tools | `read` only |
+| Hermes-facing streaming | none (`supports_streaming = False`; deferred, [issue #11](https://github.com/anpicasso/hermes-oc-free-provider/issues/11)) |
+| Cost policy | free models only |
 
-In particular, use the service only when you have the right to access it. Do
-not use this project to provide inference for third parties, resell or proxy the
-service, scrape or bulk-extract outputs, evade quotas or rate limits, rotate
-accounts or identities for additional free usage, conceal prohibited activity,
-or bypass an access restriction. A disclaimer cannot make a prohibited use
-compliant. If OpenCode requires an account, API key, paid access, or a supported
-client for your intended use, do not use this compatibility transport instead.
+## Requirements
 
-Free-model labels describe pricing, not permission or privacy. Some free,
-trial, and contributor models may use prompts or completions for model
-improvement or may prohibit confidential data. Check the current Zen model
-notice before every use and never send secrets or regulated data unless the
-applicable terms expressly allow it.
+- **Official `opencode` >= 2.3.0.** Hermes never downloads, installs or
+  upgrades it. Resolution order: a usable `opencode` on the Hermes process
+  `PATH`, then
+  `plugins.entries.oc-free-provider.settings.binary_path` in the active
+  profile's `config.yaml`. Core's resolved executable is used only as a
+  validated fallback hint, never ahead of PATH or config. There is **no
+  environment-variable binary setting**.
+  Shell aliases/functions and an interactive shell's `PATH` are not the gateway
+  process environment.
+- **Stock Hermes.** The plugin manifest declares Hermes `>=0.23.1`. The
+  provider uses the public profile and client APIs plus a few version-pinned
+  host helpers for auth and model onboarding; `plugins validate` reports those
+  private imports as a warning. No Hermes core patch is required.
+- **Python interpreter that runs Hermes.** No extra Python packages are
+  declared. The bundled TypeScript companion uses modules supplied by the
+  official OpenCode host, so there is no separate npm/Bun install step.
+- **Execution compatibility.** Launch is an argv list with no shell, and the
+  runtime owns its process group/session portably. Linux is exercised by the
+  suite; macOS and Windows have portable startup/teardown code but are **not
+  claimed verified** until startup, cancellation and cleanup are tested there.
 
-## Bidirectional tool translation
-
-Hermes remains the agent runtime: it applies its normal policy and approval
-rules, executes tools locally, and returns each result to the model. The plugin
-is a bidirectional adapter between OpenCode's tool vocabulary and Hermes':
-
-1. **Hermes → OpenCode:** available native Hermes schemas are exposed under
-   their OpenCode-compatible names. Their native duplicates are omitted, while
-   unrelated Hermes tools remain available under their native names.
-2. **OpenCode → Hermes:** model tool calls are translated back to native Hermes
-   names and argument shapes before local dispatch.
-3. **Hermes → OpenCode continuation:** recorded native calls are translated
-   back to OpenCode names and arguments when conversation history is replayed,
-   keeping the model on one consistent vocabulary. Tool results retain their
-   call IDs and payloads. Explicit tool choices are translated the same way.
-
-The bidirectional pairs are:
-
-- `bash` ↔ `terminal`
-- `edit` ↔ `patch`
-- `glob` / `grep` ↔ `search_files`
-- `read` ↔ `read_file`
-- `skill` ↔ `skill_view`
-- `task` ↔ `delegate_task`
-- `todowrite` ↔ `todo_list`
-- `webfetch` ↔ `web_extract`
-- `websearch` ↔ `web_search`
-- `write` ↔ `write_file`
-
-An alias is advertised only when its target tool was supplied by Hermes. If the
-model calls an unavailable compatibility alias, the request fails
-closed—nothing is executed and no success is fabricated. Streamed tool
-arguments are buffered until their JSON is complete before translation.
-
-The adapters preserve executable intent, not every OpenCode runtime option.
-`bash.timeout` is converted from milliseconds to seconds; todo order is
-preserved but OpenCode's priority label is discarded; OpenCode `read` directory
-listing and image-attachment behavior is not emulated; `webfetch`
-formatting/timeout hints and advanced `websearch` crawl hints have no Hermes
-equivalent; and OpenCode task metadata is passed to the Hermes subagent as
-context while Hermes controls scheduling.
-
-## Install
+### Configure the binary
 
 ```bash
-hermes plugins install oc-free-provider --enable
+# Preferred: a usable opencode on the Hermes process PATH.
+opencode --version    # must print 2.3.0 or newer
+
+# Otherwise save an absolute path through the native onboarding surfaces:
+hermes auth add opencode-free   # interactive: validates, then saves
+hermes model                    # same shared onboarding, then model picker
 ```
 
-The plugin does not install or run the OpenCode CLI, Node.js, npm, or `npx`.
+The saved value is a validated absolute path, written through Hermes'
+plugin-settings writer (the same one `ctx.set_config` uses). A validated path is
+never replaced by a shell command or arguments. Onboarding leaves the
+configuration unchanged when cancelled or given an invalid path.
 
-**It does need [Bun](https://bun.sh).** Since OpenCode's October 2026 gateway
-change, anonymous free-tier requests are only answered when they leave from
-Bun's TLS stack: the same headers and body from Python, curl, Node, or even
-curl-impersonate get `429 FreeUsageLimitError`. Inference is therefore posted
-through `oc_transport.js` (`bun oc_transport.js`); model discovery still uses
-Python's standard-library HTTPS client. Install Bun once:
+## Install into an isolated home
+
+Do not modify the active profile for evaluation. `HERMES_HOME` selects an
+isolated profile; the plugin lives under `$HERMES_HOME/plugins/`. Registration
+and import start no OpenCode process; the provider starts its private runtime
+lazily on the first catalog or model request.
+
+Install a reviewed 40-character commit SHA from this public repository, not a
+moving branch:
 
 ```bash
-curl -fsSL https://bun.sh/install | bash
+export HERMES_HOME="$(mktemp -d "$HOME/.cache/hermes-native-evaluation/home.XXXXXX")"
+hermes plugins install anpicasso/hermes-oc-free-provider --ref "$VERIFIED_COMMIT_SHA" --enable
+hermes plugins doctor oc-free-provider --ci
 ```
 
-The plugin finds `bun` on `PATH`, or at `~/.bun/bin/bun`, and `OC_FREE_BUN`
-overrides both. Without Bun every request fails immediately with that
-instruction instead of a misleading 429.
-
-Select the provider and one of its discovered models:
+`plugins doctor` must report the registration `provider(s): opencode-free`.
+Then either put a usable `opencode` on the process `PATH`, or run
+`hermes auth add opencode-free` inside that home and save an absolute path.
+Select the provider and a discovered free model through the normal picker
+(`hermes model`) or an invocation override:
 
 ```bash
-hermes model
-# Provider: opencode-free
+HERMES_HOME="$HERMES_HOME" hermes --provider oc-free -m <free-model-id>
 ```
 
-## What the gateway now requires
+The catalog is read live from the resolved binary before inference. Only enabled
+`opencode` models whose input, output, cache-read and cache-write prices are
+explicitly zero in **every** tier are admitted. Empty or unknown pricing is not
+free. There is no paid fallback and no legacy spoofing transport.
 
-Each free-tier request carries the identity the gateway checks for:
+## How a request works
 
-- `ses_` session id in OpenCode's *descending* sortable form (12 hex chars of an
-  inverted millisecond timestamp, then 14 base62), sent as `x-opencode-session`
-  and repeated in the prompt;
-- a system message containing OpenCode's `<env>` block with
-  `Current conversation session ID`, `Working directory`, and
-  `Workspace root folder`;
-- `stream: true` and a non-empty tool list;
-- `User-Agent: opencode/latest/<version>/cli` and `Authorization: Bearer public`;
-- the Bun transport described above.
+1. The client resolves and validates the binary, then starts one private
+   `opencode serve --stdio --port 0 --hostname 127.0.0.1` process per runtime
+   owner. The child inherits only a small environment allowlist and gets a fresh
+   random `OPENCODE_PASSWORD`.
+2. The bundled companion is loaded from the private `opencode.json` and runs
+   inside that official server. It exposes authenticated JSON RPC over loopback
+   and observes each primary Chat Completions SSE response non-destructively.
+3. The model-facing catalog is **native `read` plus every genuine Hermes tool
+   the session exposes**, with the host's full descriptions and schemas. Every
+   other native descriptor (edit, write, patch, shell, grep/glob, subagent,
+   webfetch/websearch, skill, question, `execute`, browser/opencode/console
+   families) is removed before the request. OpenCode executes no tool.
+4. A model-emitted native `read` is translated to an ordinary Hermes
+   `read_file` call. Hermes dispatches it through its normal loop, approvals and
+   policy. On the next completion the canonical Hermes history is replayed as
+   the native snapshot with the original wire names and arguments.
+5. Text, reasoning and tool names/arguments/call IDs come from OpenCode's own
+   events. The raw SSE observer only decides whether a completion is complete
+   and safe to release.
 
-The endpoint is `https://opencode.ai/inference/openai/v1`; the older
-`/zen/v1` paths no longer serve free models.
+## Supported surface
 
-## Model discovery
+One native compatibility tool: `read` → Hermes `read_file`.
 
-OpenCode's live `/inference/v1/models` response is the authoritative catalog:
-every advertised model whose id ends in `-free` is exposed, even when
-[models.dev](https://models.dev/) has not published it yet. models.dev metadata
-is consulted when available to exclude deprecated models, drop models without
-tool calling, and include zero-cost models that do not carry the `-free` suffix
-(such as `big-pickle`). Ids the relay still lists but no longer serves are
-excluded explicitly. The current free catalog is served over
-`/chat/completions`.
+- `path` is required; native `offset` 0 or 1 both mean line 1; positive
+  `offset`/`limit` map to `read_file` (limit capped at 2000).
+- Negative `offset` (tail read) has no Hermes equivalent and is refused rather
+  than silently changed.
+- Full Hermes `read_file` is still advertised independently with its own schema
+  and semantics; the compatibility adapter is not a promise of every native
+  `read` behavior.
 
-The catalog is re-read while the process runs: the relay's list is refreshed at
-most every 10 minutes, models.dev metadata every 6 hours (it is a
-multi-megabyte payload). A gateway process that lived for days would otherwise
-keep serving the catalog it read at start-up. The discovered list is persisted
-under the active Hermes profile and used when a refresh fails; that persisted
-copy is dropped after a week. The bundled list is the last resort, used before
-the first successful discovery or while the relay is unreachable.
+Every other capability (write, edit/patch, shell, search, web, delegation,
+skills, todos, browser, Python execution) comes from the genuine Hermes tools
+enabled in the session. They are advertised byte-for-byte. A Hermes tool whose
+name collides with a native registry id (for example `patch`) is advertised
+under the reversible wire alias `hermes_<name>` and never dropped.
 
-Hermes shows a provider's curated floor (`fallback_models`) merged with its
-live list, so the plugin pins the floor to the last discovered catalog: a
-static floor would keep retired ids in the picker and hide newly launched free
-models. The picker therefore lists exactly the free ids the relay currently
-serves.
+If `read_file` is unavailable, the provider fails before inference instead of
+advertising a compatibility read that cannot run.
 
-Model availability, pricing, retention, and data-use rules belong to OpenCode
-and the underlying provider and can change independently of this repository.
+Option restrictions and refusals are in [`TRANSLATION_API.md`](TRANSLATION_API.md).
 
-## Verify
+## Completion contract
+
+Before a successful completion is returned, or any executable tool call is
+released to Hermes, the primary Chat Completions response must provide:
+
+- terminal `[DONE]`;
+- a supported, consistent `finish_reason` (`stop`, `tool_calls`, `length`);
+- valid `prompt_tokens` and `completion_tokens` (zero is valid; missing,
+  negative, non-integer or inconsistent totals are not).
+
+Missing/malformed fields, an explicit stream error, truncation or unsupported
+framing produce a clear provider error naming the model and the failed
+contract, with **zero** tool executions and no weaker retry. Optional cache /
+reasoning-token breakdowns and opaque native metadata are preserved when
+supplied and never invented. A failed response is not evidence to remove a
+model from discovery; real upstream HTTP status is preserved when one exists.
+
+## Limitations
+
+- **Native JavaScript `execute` is unsupported and removed from the catalog.**
+  If a model emits it anyway, the companion hard-refuses it before any
+  interpreter runs and `decide` never authorizes a program. Hermes's Python
+  `execute_code` is an ordinary additive tool when the session enables it.
+- **Other native tools are removed, not translated.** Unsolicited native calls
+  (write, edit, shell, subagent, ...) are refused with no side effect; Hermes
+  never receives a tool it did not advertise.
+- **No streaming and no generation controls yet.** `stream=True`,
+  non-`auto` `tool_choice`, `temperature`, `top_p`, token limits, `stop`,
+  `response_format` and `reasoning_effort` are refused at create time. True
+  incremental streaming and control parity are deferred together in
+  [issue #11](https://github.com/anpicasso/hermes-oc-free-provider/issues/11);
+  unsupported non-default values are never silently ignored.
+- **No auxiliary model advertised.** Auxiliary requests send controls this
+  transport cannot map yet, so `resolve_aux_model` returns `""` and an auxiliary
+  attempt fails loudly instead of pretending those controls were honored.
+- **Free models only.** Broader authenticated providers require separate
+  explicit work; this profile cannot silently widen. It does not infer
+  authentication from unrelated Hermes/environment credentials or copy an
+  existing OpenCode login.
+- **Chat Completions SSE only.** A catalog entry whose native package is not
+  `@opencode/ai/providers/openai-compatible` stays discoverable with a reason
+  but refuses inference; no speculative protocol adapters exist.
+- **Linux verified only.** Startup, cancellation and cleanup tests exist for
+  Linux; other platforms share the portable argv/process-group code but are not
+  claimed as verified.
+
+## Evidence boundary
+
+Offline tests run against the installed official 2.3.0 binary with the
+deterministic loopback fixture model. Fixture output is never described as a
+hosted response. The recorded offline command (core venv interpreter,
+`PYTHONPATH=<core checkout>`, isolated `HERMES_HOME` set before Python starts):
 
 ```bash
-python -m unittest discover -s tests -v
-hermes plugins validate . --json
-python -c "import hermes_oc_client as c; print(c.OpenCodeClient().chat.completions.create(model='big-pickle', messages=[{'role':'user','content':'say PONG'}], tools=[{'type':'function','function':{'name':'read_file','parameters':{'type':'object','properties':{}}}}]).choices[0].message.content)"
+PYTHONPATH=/path/to/hermes-core-checkout \
+  /path/to/hermes-core/venv/bin/python -m unittest discover -s tests -t . -q
+# Ran 99 tests ... OK
 ```
 
-`hermes plugins doctor .` also verifies runtime discovery, import, and provider
-registration.
+Hosted evidence for this iteration is bounded to one stock `AIAgent` run with
+this source tree: native `read` wire name (`ocn1.read.…`) translated to
+Hermes `read_file`, token recovered, measured usage, `finish=stop`.
 
-## License
+The hosted checks are bounded: they do not prove every discovered free model,
+long-running workloads or tool execution on models that only returned text.
+Hosted quotas, rate limits and upstream account/service policy remain separate.
 
-MIT.
+## Tests
+
+Run from the repository root. Tests force a temporary `HERMES_HOME` **before**
+Python imports so discovery cannot load an installed copy. They resolve the
+official binary from the test-only `HERMES_OPENCODE_BINARY` variable or the
+process `PATH`; the provider itself never reads that variable.
+
+```bash
+export TMPDIR=/path/to/scratch
+export HERMES_OPENCODE_BINARY=/path/to/opencode
+# Set an isolated home BEFORE Python starts; use the core venv interpreter and
+# put the core checkout on PYTHONPATH so imports never depend on discovery order.
+export HERMES_HOME="$(mktemp -d "$TMPDIR/oc-test-home.XXXXXX")"
+export PYTHONPATH=/path/to/hermes-core-checkout
+/path/to/hermes-core/venv/bin/python -m unittest discover -s tests -t . -v
+```
+
+Translation-only tests need no binary:
+
+```bash
+python -m unittest discover -s tests -t . -p 'test_translation*.py' -v
+```
+
+## Documentation
+
+- [`docs/compatibility.md`](docs/compatibility.md) — binary provenance,
+  transport and cost boundary.
+- [`TRANSLATION_API.md`](TRANSLATION_API.md) — native/Hermes mapping, accepted
+  options and refusal rules.
+- [`RUNTIME_API.md`](RUNTIME_API.md) — runtime/client lifecycle, loopback RPC,
+  authentication and request controls.
+- [`COMPANION_API.md`](COMPANION_API.md) — companion protocol, hooks and event
+  stream.
+- [`CHANGELOG.md`](CHANGELOG.md) — source changes and known limitations.
+- [`LICENSE`](LICENSE), [`docs/OPENCODE-LICENSE`](docs/OPENCODE-LICENSE).
