@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -73,7 +74,7 @@ class ClientTests(unittest.TestCase):
     def test_direct_request_preserves_hermes_tools_and_returns_native_call(self):
         captured = {}
 
-        def fake_open(request, timeout):
+        def fake_open(request, timeout, _live=None):
             captured["request"] = request
             captured["timeout"] = timeout
             return sse(
@@ -410,7 +411,7 @@ class ClientTests(unittest.TestCase):
     def test_native_tool_history_and_choice_are_rewritten_to_aliases(self):
         captured = {}
 
-        def fake_open(request, _timeout):
+        def fake_open(request, _timeout, _live=None):
             captured["body"] = json.loads(request.data)
             return sse(
                 {
@@ -551,7 +552,7 @@ class ClientTests(unittest.TestCase):
     def test_stream_error_is_explicit_and_session_is_stable(self):
         requests = []
 
-        def fake_open(request, _timeout):
+        def fake_open(request, _timeout, _live=None):
             requests.append(request)
             if len(requests) == 1:
                 return sse({"error": {"message": "boom"}})
@@ -581,7 +582,7 @@ class ClientTests(unittest.TestCase):
     def test_tool_result_is_forwarded_unchanged(self):
         captured = {}
 
-        def fake_open(request, _timeout):
+        def fake_open(request, _timeout, _live=None):
             captured["body"] = json.loads(request.data)
             return sse(
                 {
@@ -686,7 +687,7 @@ class ClientTests(unittest.TestCase):
             },
         )
 
-        def fake_open(request, _timeout):
+        def fake_open(request, _timeout, _live=None):
             captured.append((request.full_url, json.loads(request.data)))
             return first_response if len(captured) == 1 else second_response
 
@@ -778,11 +779,10 @@ class ClientTests(unittest.TestCase):
             }
         )
         with mock.patch.object(client, "_open_stream", return_value=response):
-            result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaisesRegex(
                 client.OpenCodeError, "compatibility-only tool 'bash'"
             ):
-                _ = result.choices
+                oc.chat.completions.create(model="m", messages=[], tools=[])
 
     def test_http_error_exposes_status_code(self):
         body = (
@@ -794,9 +794,8 @@ class ClientTests(unittest.TestCase):
         )
         oc = client.OpenCodeClient()
         with mock.patch.object(client, "_open_stream", side_effect=error):
-            result = oc.chat.completions.create(model="m", messages=[], tools=[])
             with self.assertRaises(client.OpenCodeError) as caught:
-                _ = result.choices
+                oc.chat.completions.create(model="m", messages=[], tools=[])
         self.assertEqual(caught.exception.status_code, 429)
         self.assertIn("FreeUsageLimitError", str(caught.exception))
 
@@ -816,7 +815,7 @@ class ClientTests(unittest.TestCase):
                 _ = oc.chat.completions.create(model="m", messages=[]).choices
 
     def test_sync_and_async_client_contract(self):
-        def fake_open(_request, _timeout):
+        def fake_open(_request, _timeout, _live=None):
             return sse(
                 {
                     "model": "m",
@@ -849,10 +848,167 @@ class ClientTests(unittest.TestCase):
         oc = client.OpenCodeClient()
         oc.close()
         with mock.patch.object(client, "_open_stream") as open_request:
-            result = oc.chat.completions.create(model="m", messages=[])
             with self.assertRaisesRegex(client.OpenCodeError, "client is closed"):
-                _ = result.choices
+                oc.chat.completions.create(model="m", messages=[])
         open_request.assert_not_called()
+
+    def _fake_bun(self, script):
+        directory = tempfile.mkdtemp()
+        path = Path(directory) / "bun"
+        path.write_text("#!/bin/sh\ncat >/dev/null\n" + script)
+        path.chmod(0o755)
+        return mock.patch.dict(os.environ, {"OC_FREE_BUN": str(path)})
+
+    def _cancel_soon(self, oc, method="cancel"):
+        timer = threading.Timer(0.3, getattr(oc, method))
+        timer.start()
+        return timer
+
+    def test_cancel_aborts_request_blocked_before_status(self):
+        # Local fixture: a fake Bun that never answers. No network.
+        oc = client.OpenCodeClient()
+        with self._fake_bun("exec sleep 30\n"):
+            self._cancel_soon(oc)
+            started = time.monotonic()
+            with self.assertRaisesRegex(client.OpenCodeError, "cancelled"):
+                oc.chat.completions.create(model="m", messages=[])
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(oc._live, set())
+        self.assertFalse(oc.is_closed)
+
+    def _race_at(self, oc, where, method):
+        """Run oc.<method>() deterministically at a startup point, not by timing."""
+        if where == "build":
+            real = client._bun_binary
+
+            def hook():
+                getattr(oc, method)()
+                return real()
+
+            return mock.patch.object(client, "_bun_binary", side_effect=hook)
+        spawned = []
+        real_popen = client.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            getattr(oc, method)()  # after spawn, before admission
+            return process
+
+        self.spawned = spawned
+        return mock.patch.object(client.subprocess, "Popen", side_effect=popen)
+
+    def test_cancel_or_close_during_startup_never_runs_the_request(self):
+        ok = json.dumps({"model": "m", "choices": [{"delta": {"content": "OK"}, "finish_reason": "stop"}]})
+        log = Path(tempfile.mkdtemp()) / "requests"
+        script = f"cat >> {log}\necho '{{\"status\":200}}'\necho 'data: {ok}'\n"
+        for where in ("build", "spawn"):
+            for method in ("cancel", "close"):
+                with self.subTest(where=where, method=method):
+                    oc = client.OpenCodeClient()
+                    self.spawned = []
+                    with self._fake_bun(script), self._race_at(oc, where, method):
+                        with self.assertRaisesRegex(client.OpenCodeError, "cancelled"):
+                            oc.chat.completions.create(model="m", messages=[])
+                    self.assertEqual(oc._live, set())
+                    self.assertTrue(all(p.returncode is not None for p in self.spawned))
+                    self.assertFalse(log.exists() and log.read_text(), "request reached Bun")
+                    with self._fake_bun(script):
+                        if method == "close":
+                            with self.assertRaisesRegex(client.OpenCodeError, "closed"):
+                                oc.chat.completions.create(model="m", messages=[])
+                        else:  # a cancel stops one request, not the client
+                            reply = oc.chat.completions.create(model="m", messages=[])
+                            self.assertEqual(reply.choices[0].message.content, "OK")
+                            log.unlink()
+
+    def test_cancel_between_stream_create_and_iteration_stops_it(self):
+        oc = client.OpenCodeClient()
+        with self._fake_bun("echo '{\"status\":200}'\n"):
+            stream = oc.chat.completions.create(model="m", messages=[], stream=True)
+            oc.cancel()
+            with self.assertRaisesRegex(client.OpenCodeError, "cancelled"):
+                list(stream)
+        self.assertEqual(oc._live, set())
+
+    def test_close_aborts_stream_blocked_mid_body(self):
+        first = json.dumps(
+            {"model": "m", "choices": [{"delta": {"content": "A"}, "finish_reason": None}]}
+        )
+        oc = client.OpenCodeClient()
+        script = f"echo '{{\"status\":200}}'\necho 'data: {first}'\nexec sleep 30\n"
+        with self._fake_bun(script):
+            stream = iter(oc.chat.completions.create(model="m", messages=[], stream=True))
+            self.assertEqual(next(stream).choices[0].delta.content, "A")
+            self._cancel_soon(oc, "close")
+            started = time.monotonic()
+            with self.assertRaisesRegex(client.OpenCodeError, "before the response completed"):
+                next(stream)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(oc.is_closed)
+        self.assertEqual(oc._live, set())
+
+    def test_bun_http_error_keeps_status_and_reaps_child(self):
+        oc = client.OpenCodeClient()
+        script = "echo '{\"status\":429}'\necho 'FreeUsageLimitError'\n"
+        with self._fake_bun(script):
+            with self.assertRaises(client.OpenCodeError) as caught:
+                oc.chat.completions.create(model="m", messages=[])
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertIn("FreeUsageLimitError", str(caught.exception))
+        self.assertEqual(oc._live, set())
+
+    def test_sync_create_is_eager_and_async_create_stays_off_loop(self):
+        calls = []
+
+        def fake_open(_request, _timeout, _live=None):
+            calls.append(threading.get_ident())
+            return sse({"model": "m", "choices": [{"delta": {"content": "OK"}, "finish_reason": "stop"}]})
+
+        oc = client.OpenCodeClient()
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
+            oc.chat.completions.create(model="m", messages=[])
+            self.assertEqual(len(calls), 1)  # ran inside create()
+
+            async def run():
+                pending = oc.chat.completions.create(model="m", messages=[])
+                self.assertEqual(len(calls), 1)  # not run on the event loop
+                result = await pending
+                self.assertNotEqual(calls[-1], threading.get_ident())
+                return result.choices[0].message.content
+
+            self.assertEqual(asyncio.run(run()), "OK")
+
+    def test_reasoning_tokens_survive_usage_normalization(self):
+        from agent.usage_pricing import normalize_usage  # type: ignore[import-not-found]
+
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 9,
+            "total_tokens": 19,
+            "completion_tokens_details": {"reasoning_tokens": 7},
+        }
+        response = sse({"model": "m", "choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}], "usage": usage})
+        oc = client.OpenCodeClient()
+        with mock.patch.object(client, "_open_stream", return_value=response):
+            result = oc.chat.completions.create(model="m", messages=[])
+        self.assertEqual(result.usage.completion_tokens_details.reasoning_tokens, 7)
+        self.assertEqual(normalize_usage(result.usage, api_mode="chat_completions").reasoning_tokens, 7)
+        self.assertEqual(client._usage(None).completion_tokens_details.reasoning_tokens, 0)
+
+    def test_reasoning_effort_reaches_chat_wire_only_when_given(self):
+        bodies = []
+
+        def fake_open(request, _timeout, _live=None):
+            bodies.append(json.loads(request.data))
+            return sse({"model": "m", "choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]})
+
+        oc = client.OpenCodeClient()
+        with mock.patch.object(client, "_open_stream", side_effect=fake_open):
+            oc.chat.completions.create(model="m", messages=[], reasoning_effort="high")
+            oc.chat.completions.create(model="m", messages=[])
+        self.assertEqual(bodies[0]["reasoning_effort"], "high")
+        self.assertNotIn("reasoning_effort", bodies[1])
 
     def test_unmappable_patch_history_replays_natively(self):
         arguments = json.dumps(
@@ -910,7 +1066,11 @@ class ClientTests(unittest.TestCase):
         catalog = {
             "opencode": {
                 "models": {
-                    "free-a": {"tool_call": True, "cost": {"input": 0, "output": 0}},
+                    "free-a": {
+                        "tool_call": True,
+                        "cost": {"input": 0, "output": 0},
+                        "limit": {"context": 123456},
+                    },
                     "free-b": {"tool_call": True, "cost": {"input": 0, "output": 0}},
                     "paid": {"tool_call": True, "cost": {"input": 1, "output": 0}},
                     "retired": {
@@ -935,11 +1095,28 @@ class ClientTests(unittest.TestCase):
                 mock.patch.object(client, "_METADATA_SNAPSHOT_AT", 0.0),
                 mock.patch.object(client, "_model_cache_path", return_value=cache),
                 mock.patch.object(client, "_urlopen", side_effect=responses) as opened,
+                mock.patch.object(client, "_MODEL_ROWS", {}),
             ):
                 oc = client.OpenCodeClient()
                 self.assertEqual(oc.list_models(), ["free-a", "free-b"])
                 self.assertEqual(oc.list_models(), ["free-a", "free-b"])
                 self.assertEqual(json.loads(cache.read_text()), ["free-a", "free-b"])
+                # Rows saved only for discovered models, and reread cold.
+                rows = json.loads(cache.with_name("model-rows.json").read_text())
+                self.assertEqual(sorted(rows), ["free-a", "free-b"])
+                client._MODEL_ROWS.clear()
+                self.assertEqual(client.catalog_row("free-a")["limit"]["context"], 123456)
+                self.assertEqual(client.catalog_row("paid"), {})
+                # A successful live list with absent/malformed metadata must
+                # clear stale rows, not break discovery or retain old controls.
+                for metadata in ({}, {"opencode": {"models": ["malformed"]}}):
+                    with (
+                        mock.patch.object(client, "_json_get", return_value={"data": [{"id": "new-free"}]}),
+                        mock.patch.object(client, "_models_dev_metadata", return_value=metadata),
+                    ):
+                        self.assertEqual(client._discover_models(1), ["new-free"])
+                        self.assertEqual(client.catalog_row("free-a"), {})
+                        self.assertEqual(json.loads(cache.with_name("model-rows.json").read_text()), {})
         self.assertEqual(
             [call.args[0].full_url for call in opened.call_args_list],
             [client.ZEN_MODELS_URL, client.MODELS_DEV_URL],

@@ -168,13 +168,41 @@ static floor would keep retired ids in the picker and hide newly launched free
 models. The picker therefore lists exactly the free ids the relay currently
 serves.
 
+Discovery also saves each discovered model's models.dev row next to that list.
+The provider answers two hooks from that saved row without making a request:
+
+- `get_model_context_length` returns `limit.context`, so the context meter and
+  compression use the free model's own window rather than a generic or
+  paid-sibling fallback.
+- `reasoning_effort` is sent only for a model whose row declares an `effort`
+  option, clamped to the nearest weaker declared level; a request below the
+  weakest declared level is omitted, never raised. Thinking-off (`none`) is
+  sent only when the model lists it. Unknown models, models that only
+  declare a toggle, and an unset effort send nothing and keep the model's
+  default.
+
+## Cancellation and usage
+
+An interrupt or stale-call abort kills the in-flight Bun process
+(`OpenCodeClient.cancel()`, also called by `close()`), whether it is still
+waiting for the status line or is mid-stream. A cancel during request
+startup is also honoured: a Bun process spawned for a cancelled request is
+refused and killed before it receives the request, and after `close()` no
+new request can start. A response cut off this way
+raises an error and is never returned as a complete answer. Non-streaming
+`create()` runs the request immediately when called from synchronous code;
+under an event loop it stays awaitable and runs off the loop. Reasoning-token
+counts from the final usage chunk are passed through to Hermes.
+
 Model availability, pricing, retention, and data-use rules belong to OpenCode
 and the underlying provider and can change independently of this repository.
 
 ## Verify
 
 ```bash
-python -m unittest discover -s tests -v
+# tests/test_profile.py drives Hermes' own consumers: run with Hermes core
+# on PYTHONPATH and a throwaway HERMES_HOME.
+HERMES_HOME="$(mktemp -d)" PYTHONPATH=/path/to/hermes-agent python -m unittest discover -s tests -v
 hermes plugins validate . --json
 python -c "import hermes_oc_client as c; print(c.OpenCodeClient().chat.completions.create(model='big-pickle', messages=[{'role':'user','content':'say PONG'}], tools=[{'type':'function','function':{'name':'read_file','parameters':{'type':'object','properties':{}}}}]).choices[0].message.content)"
 ```

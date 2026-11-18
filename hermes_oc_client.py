@@ -242,6 +242,9 @@ _MODEL_SNAPSHOT_LOCK = threading.Lock()
 _METADATA_SNAPSHOT: dict[str, Any] | None = None
 _METADATA_SNAPSHOT_AT = 0.0
 _METADATA_SNAPSHOT_LOCK = threading.Lock()
+# models.dev rows of the discovered free models, keyed by resolved Hermes home
+# so one imported module never serves profile A's rows to profile B.
+_MODEL_ROWS: dict[str, dict[str, Any]] = {}
 
 
 class OpenCodeError(RuntimeError):
@@ -285,9 +288,10 @@ def _bun_binary() -> str | None:
 class _BunStream:
     """urllib-response lookalike over the Bun transport's stdout."""
 
-    def __init__(self, process: subprocess.Popen, timer: threading.Timer):
+    def __init__(self, process: subprocess.Popen, timer: threading.Timer, owner: Any):
         self._process = process
         self._timer = timer
+        self._owner = owner
 
     def __enter__(self) -> "_BunStream":
         return self
@@ -300,6 +304,12 @@ class _BunStream:
         if stdout is None:
             return
         yield from stdout
+        # EOF from a killed Bun (cancel, timeout, crash) is a cut-off response,
+        # never a complete one: oc_transport.js exits 0 only after the body.
+        if self._process.wait() != 0:
+            raise OpenCodeError(
+                "OpenCode transport ended before the response completed."
+            )
 
     def read(self) -> bytes:
         stdout = self._process.stdout
@@ -312,9 +322,13 @@ class _BunStream:
         if self._process.stdout is not None:
             self._process.stdout.close()
         self._process.wait()
+        if self._owner is not None:
+            self._owner[0]._release(self._process)
 
 
-def _bun_open(request: urllib.request.Request, timeout: float, bun: str):
+def _bun_open(
+    request: urllib.request.Request, timeout: float, bun: str, owner: Any = None
+):
     data = request.data if isinstance(request.data, (bytes, bytearray)) else b""
     payload = json.dumps(
         {
@@ -330,6 +344,11 @@ def _bun_open(request: urllib.request.Request, timeout: float, bun: str):
         stderr=subprocess.DEVNULL,
     )
     try:
+        # Admitted before the first write/read, so cancel() reaches a request
+        # still waiting for the status line; refused if cancel()/close() ran
+        # since the request started, so a raced spawn never runs.
+        if owner is not None and not owner[0]._admit(process, owner[1]):
+            raise OpenCodeError("OpenCode request was cancelled.")
         assert process.stdin is not None and process.stdout is not None
         process.stdin.write(payload)
         process.stdin.close()
@@ -340,6 +359,8 @@ def _bun_open(request: urllib.request.Request, timeout: float, bun: str):
             status = 0
         if status <= 0:
             body = process.stdout.read().decode("utf-8", "replace")
+            if process.wait() < 0:
+                raise OpenCodeError("OpenCode request was cancelled.")
             raise OpenCodeError(f"OpenCode transport failed: {body[:500] or 'no status'}")
         if status >= 400:
             body = process.stdout.read().decode("utf-8", "replace")
@@ -354,18 +375,30 @@ def _bun_open(request: urllib.request.Request, timeout: float, bun: str):
         timer = threading.Timer(timeout, process.kill)
         timer.daemon = True
         timer.start()
-        return _BunStream(process, timer)
+        return _BunStream(process, timer, owner)
     except BaseException:
         if process.poll() is None:
             process.kill()
+        process.wait()
+        for pipe in (process.stdin, process.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:  # stdin to a killed child: broken pipe
+                    pass
+        if owner is not None:
+            owner[0]._release(process)
         raise
 
 
-def _open_stream(request: urllib.request.Request, timeout: float):
-    """POST through Bun. The free tier answers every other TLS stack with 429."""
+def _open_stream(request: urllib.request.Request, timeout: float, owner: Any = None):
+    """POST through Bun. The free tier answers every other TLS stack with 429.
+
+    ``owner`` is ``(client, ticket)`` from ``OpenCodeClient._ticket()``.
+    """
     bun = _bun_binary()
     if bun:
-        return _bun_open(request, timeout, bun)
+        return _bun_open(request, timeout, bun, owner)
     raise OpenCodeError(
         "OpenCode's free tier requires Bun as the HTTP transport. "
         "Install it with 'curl -fsSL https://bun.sh/install | bash' "
@@ -454,11 +487,14 @@ def _load_model_cache() -> list[str]:
 
 
 def _save_model_cache(models: list[str]) -> None:
-    path = _model_cache_path()
+    _save_json(_model_cache_path(), models)
+
+
+def _save_json(path: Path, value: Any) -> None:
     temporary = path.with_suffix(f".{secrets.token_hex(4)}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(json.dumps(models) + "\n", encoding="utf-8")
+        temporary.write_text(json.dumps(value) + "\n", encoding="utf-8")
         temporary.replace(path)
     except OSError:
         try:
@@ -495,15 +531,24 @@ def _models_dev_metadata(timeout: float) -> dict[str, Any]:
 
 def _discover_models(timeout: float) -> list[str]:
     """Live free-model catalog: the relay first, models.dev as the refinement."""
+    metadata: Any = {}
     try:
-        models = _free_live_models(
-            _json_get(ZEN_MODELS_URL, timeout),
-            _models_dev_metadata(timeout),
-        )
+        zen = _json_get(ZEN_MODELS_URL, timeout)
+        metadata = _models_dev_metadata(timeout)
+        models = _free_live_models(zen, metadata)
     except (OSError, ValueError, urllib.error.URLError):
         models = []
     if models:
         _save_model_cache(models)
+        provider = metadata.get("opencode") if isinstance(metadata, dict) else None
+        known = provider.get("models") if isinstance(provider, dict) else None
+        if not isinstance(known, dict):
+            known = {}
+        rows = {m: known[m] for m in models if isinstance(known.get(m), dict)}
+        # Successful discovery replaces metadata even when no rows are known;
+        # otherwise retired capabilities survive indefinitely in the cache.
+        _MODEL_ROWS[str(get_hermes_home())] = rows
+        _save_json(_rows_cache_path(), rows)
         return models
     return _load_model_cache() or list(FALLBACK_MODELS)
 
@@ -543,6 +588,50 @@ def sync_profile_catalog(profile: Any, models: list[str]) -> tuple[str, ...]:
         capabilities.setdefault(model, {"supports_tools": True})
     profile.model_capabilities = capabilities
     return discovered
+
+
+def _rows_cache_path() -> Path:
+    return _model_cache_path().with_name("model-rows.json")
+
+
+def catalog_row(model: str | None) -> dict[str, Any]:
+    """The model's models.dev `opencode` row saved by the last discovery, or {}.
+
+    Hot-path safe: memory, else one small profile-scoped file; never a request.
+    {} means unknown, and callers then leave limits and reasoning controls to
+    the host defaults.
+    """
+    if not isinstance(model, str) or not model:
+        return {}
+    home = str(get_hermes_home())
+    rows = _MODEL_ROWS.get(home)
+    if rows is None:
+        try:
+            rows = json.loads(_rows_cache_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            rows = None
+        rows = _MODEL_ROWS[home] = rows if isinstance(rows, dict) else {}
+    row = rows.get(model.removeprefix("opencode/"))
+    return row if isinstance(row, dict) else {}
+
+
+def reasoning_efforts(model: str | None) -> tuple[str, ...] | None:
+    """Effort levels the catalog declares for a chat-route model.
+
+    None when unknown (no row, Responses route, or no effort option such as a
+    bare thinking toggle): nothing reasoning-related is sent then.
+    """
+    name = str(model or "").removeprefix("opencode/")
+    options = catalog_row(name).get("reasoning_options")
+    if name in RESPONSES_MODELS or not isinstance(options, list):
+        return None
+    for option in options:
+        if isinstance(option, dict) and option.get("type") == "effort":
+            values = option.get("values")
+            if not isinstance(values, list):
+                return None
+            return tuple(v for v in values if isinstance(v, str) and v) or None
+    return None
 
 
 def _session_id() -> str:
@@ -781,12 +870,21 @@ def _usage(value: Any = None) -> SimpleNamespace:
     total = int(raw.get("total_tokens", prompt + completion) or prompt + completion)
     raw_details = raw.get("prompt_tokens_details")
     details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
+    raw_completion = raw.get("completion_tokens_details")
+    completion_details: dict[str, Any] = (
+        raw_completion if isinstance(raw_completion, dict) else {}
+    )
     return SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=total,
         prompt_tokens_details=SimpleNamespace(
             cached_tokens=int(details.get("cached_tokens", 0) or 0)
+        ),
+        # Hermes reads chat-completions thinking tokens from here
+        # (agent/usage_pricing.py normalize_usage).
+        completion_tokens_details=SimpleNamespace(
+            reasoning_tokens=int(completion_details.get("reasoning_tokens", 0) or 0)
         ),
     )
 
@@ -1414,9 +1512,44 @@ class OpenCodeClient:
         )
         self.is_closed = False
         self._session = _session_id()
+        # Hermes' interrupt/stale watchdog calls cancel() from another thread
+        # (agent/client_lifecycle.py); there is no socket here to shut down, so
+        # killing the Bun child is the abort. A request takes a ticket (the
+        # generation) when it starts; cancel() bumps the generation, so a Bun
+        # spawned for an older ticket is refused admission and killed. The lock
+        # guards only these fields: never Popen, pipe I/O, or kill().
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._live: set[subprocess.Popen] = set()
+
+    def _ticket(self) -> int:
+        with self._lock:
+            if self.is_closed:
+                raise OpenCodeError("OpenCode client is closed.")
+            return self._generation
+
+    def _admit(self, process: subprocess.Popen, ticket: int) -> bool:
+        with self._lock:
+            admitted = not self.is_closed and ticket == self._generation
+            if admitted:
+                self._live.add(process)
+        return admitted
+
+    def _release(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._live.discard(process)
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._generation += 1
+            live = list(self._live)
+        for process in live:
+            process.kill()  # no-op once the child has been reaped
 
     def close(self) -> None:
-        self.is_closed = True
+        with self._lock:
+            self.is_closed = True
+        self.cancel()
 
     def list_models(self, *, timeout: float = 15.0) -> list[str]:
         return list(_models_for_process(timeout))
@@ -1439,6 +1572,9 @@ class OpenCodeClient:
     ) -> Any:
         seconds = _effective_timeout(timeout)
         selected = str(model or DEFAULT_MODEL)
+        # Taken now, not when the lazy stream/await runs: a cancel() in between
+        # must still stop this request.
+        ticket = self._ticket()
 
         def factory() -> SimpleNamespace:
             events, mapped_tools = self._direct_events(
@@ -1453,13 +1589,23 @@ class OpenCodeClient:
                 stop=stop,
                 extra_body=extra_body,
                 extra=kwargs,
+                ticket=ticket,
             )
             return _merge_sse(
                 events, requested_model=selected, mapped_tools=mapped_tools
             )
 
         if not stream:
-            return _LazyValue(factory)
+            value = _LazyValue(factory)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # Plain sync caller: block here like the OpenAI SDK, so the
+                # request runs inside Hermes' interruptible worker, watchdog
+                # and latency measurement instead of at first attribute read.
+                value._resolve()
+            # On an event loop it stays lazy: `await` resolves it off-loop.
+            return value
 
         def stream_factory() -> Iterator[SimpleNamespace]:
             events, mapped_tools = self._direct_events(
@@ -1474,6 +1620,7 @@ class OpenCodeClient:
                 stop=stop,
                 extra_body=extra_body,
                 extra=kwargs,
+                ticket=ticket,
             )
             for event in _stream_sse(
                 events, requested_model=selected, mapped_tools=mapped_tools
@@ -1496,9 +1643,8 @@ class OpenCodeClient:
         stop: Any,
         extra_body: dict[str, Any] | None,
         extra: dict[str, Any],
+        ticket: int,
     ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
-        if self.is_closed:
-            raise OpenCodeError("OpenCode client is closed.")
         if "/" in model:
             provider, model = model.split("/", 1)
             if provider != "opencode":
@@ -1518,6 +1664,7 @@ class OpenCodeClient:
                 top_p=top_p,
                 extra_body=extra_body,
                 extra=extra,
+                ticket=ticket,
             )
         wire_tools, mapped_tools = _wire_tools(tools)
         body: dict[str, Any] = {
@@ -1538,6 +1685,9 @@ class OpenCodeClient:
             "stop": stop,
             "parallel_tool_calls": extra.get("parallel_tool_calls"),
             "response_format": extra.get("response_format"),
+            # Only set by the profile, and only for levels the model's catalog
+            # row declares (__init__.py build_api_kwargs_extras).
+            "reasoning_effort": extra.get("reasoning_effort"),
         }
         body.update(
             {key: value for key, value in optional.items() if value is not None}
@@ -1567,9 +1717,10 @@ class OpenCodeClient:
 
         def events() -> Iterator[dict[str, Any]]:
             try:
-                response = _open_stream(request, timeout)
+                response = _open_stream(request, timeout, (self, ticket))
             except urllib.error.HTTPError as exc:
-                body_text = exc.read().decode("utf-8", "replace")
+                with exc:
+                    body_text = exc.read().decode("utf-8", "replace")
                 raise _status_error(
                     exc.code, body_text, "OpenCode free-model inference"
                 ) from exc
@@ -1603,6 +1754,7 @@ class OpenCodeClient:
         top_p: Any,
         extra_body: dict[str, Any] | None,
         extra: dict[str, Any],
+        ticket: int,
     ) -> tuple[Iterator[dict[str, Any]], dict[str, str]]:
         wire_tools, mapped_tools = _wire_tools(tools)
         input_items, instructions = _responses_input(messages, mapped_tools, self._session)
@@ -1659,9 +1811,10 @@ class OpenCodeClient:
 
         def source() -> Iterator[dict[str, Any]]:
             try:
-                response = _open_stream(request, timeout)
+                response = _open_stream(request, timeout, (self, ticket))
             except urllib.error.HTTPError as exc:
-                body_text = exc.read().decode("utf-8", "replace")
+                with exc:
+                    body_text = exc.read().decode("utf-8", "replace")
                 raise _status_error(
                     exc.code, body_text, "OpenCode free-model inference"
                 ) from exc
@@ -1784,6 +1937,9 @@ class OpenCodeClient:
                             "total_tokens": usage.get("total_tokens", 0),
                             "prompt_tokens_details": usage.get(
                                 "input_tokens_details", {}
+                            ),
+                            "completion_tokens_details": usage.get(
+                                "output_tokens_details", {}
                             ),
                         },
                     }

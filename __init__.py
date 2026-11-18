@@ -21,6 +21,8 @@ try:
         FALLBACK_MODELS,
         LOGICAL_BASE_URL,
         OpenCodeClient,
+        catalog_row,
+        reasoning_efforts,
         sync_profile_catalog,
     )
 except ImportError:  # loaded as a flat module (no package context)
@@ -29,15 +31,51 @@ except ImportError:  # loaded as a flat module (no package context)
         FALLBACK_MODELS,
         LOGICAL_BASE_URL,
         OpenCodeClient,
+        catalog_row,
+        reasoning_efforts,
         sync_profile_catalog,
     )
 from providers import register_provider  # type: ignore[import-not-found]
 from providers.base import ProviderProfile  # type: ignore[import-not-found]
 
 
+# Hermes' effort ladder, weakest first ("ultra" is Hermes-only and clamps down).
+_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
 class OpenCodeFreeProfile(ProviderProfile):
     def create_client(self, **client_kwargs: Any) -> OpenCodeClient:
         return OpenCodeClient(**client_kwargs)
+
+    def get_model_context_length(self, model: str) -> int | None:
+        limit = catalog_row(model).get("limit")
+        context = limit.get("context") if isinstance(limit, dict) else None
+        return context if type(context) is int and context > 0 else None
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, **context: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Top-level `reasoning_effort`, only at a level the model declares.
+
+        Unknown models, toggle-only models, and an unset effort send nothing,
+        leaving the model on its own default.
+        """
+        levels = reasoning_efforts(context.get("model"))
+        if not levels or not isinstance(reasoning_config, dict):
+            return {}, {}
+        effort = str(reasoning_config.get("effort") or "").strip().lower()
+        if reasoning_config.get("enabled") is False or effort == "none":
+            effort = "none"  # sent only if the model lists it; else model default
+        elif effort in _LADDER and effort not in levels:
+            # Nearest weaker declared level (thinking-off excluded). Nothing
+            # weaker declared: omit, never escalate to a stronger level.
+            weaker = [
+                lvl
+                for lvl in _LADDER[1 : _LADDER.index(effort)]
+                if lvl in levels
+            ]
+            effort = weaker[-1] if weaker else ""
+        return ({}, {"reasoning_effort": effort}) if effort in levels else ({}, {})
 
     def fetch_models(
         self,
