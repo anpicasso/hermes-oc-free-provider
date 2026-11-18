@@ -351,7 +351,7 @@ Production event types include:
 - `catalog_filtered {removed}` — native descriptors removed from the
   model-facing request;
 - `native_refused {callID, generation, name, reason}` — an unadvertised native
-  tool outside `read`/`execute` was emitted;
+  tool outside the session's `nativeTools`/`execute` was emitted;
 - `reasoning {assistantMessageID, text, native}` and
   `text {assistantMessageID, text, native}` from OpenCode's own ending events;
 - `prompt_settled`, `prompt_error`, `event_stream_error`, `closed`.
@@ -371,8 +371,10 @@ usage is a rejection, never zero and never `null`-as-success.
 3. Native registry ids are reserved; Python supplies a reversible alias (for
    example `hermes_patch`) instead of colliding. The companion refuses any
    remaining collision before traffic and never silently renames.
-4. One catalog policy runs in the `context` hook: keep native `read` (only while
-   `read_file` is registered) and every genuine Hermes entry; delete every
+4. One catalog policy runs in the `context` hook: keep the native descriptors
+   named by the session's `nativeTools` (from `open`/`advance`; each must be a
+   translated, registered native that Hermes does not own; omitted = `read`
+   while `read_file` is registered) and every genuine Hermes entry; delete every
    other native descriptor before the request. Removal is by identity, never a
    name filter, so a Hermes tool is never dropped because OpenCode shares its
    name. Removed names are reported as `catalog_filtered`.
@@ -389,8 +391,8 @@ usage is a rejection, never zero and never `null`-as-success.
 
 ## Native JavaScript refusal
 
-- `execute.before` checks every call. The exposed native `read` and registered
-  Hermes tools may dispatch through their held executor. Native `execute`
+- `execute.before` checks every call. The session's kept native descriptors and
+  registered Hermes tools may dispatch through their held executor. Native `execute`
   emits `execute_refused`; any other unexposed native emits `native_refused`.
   Both throw before an interpreter or executor runs.
 - `execute.after` is defence in depth: if an `execute` completion is ever

@@ -687,6 +687,26 @@ class RegistryTests(CompanionCase):
         self.assertNotIn("write_file", self.body_tools(fixture.records[2]))
         third.close()
 
+    def test_native_subset_is_explicit_and_validated(self) -> None:
+        fixture = self.fixture()
+        runtime = self.runtime(TEST_COMPANION, fixture)
+        for bad in (["edit"], ["shell"], ["patch"], ["no_such_tool"]):
+            with self.subTest(bad=bad), self.assertRaises(RpcFailure) as caught:
+                runtime.rpc("open", {"providerID": "opencode", "modelID": "nonce",
+                                     "hermesTools": [READ_FILE_TOOL], "nativeTools": bad})
+            self.assertIn("cannot be exposed", caught.exception.body)
+        self.assertEqual(runtime.hello()["sessions"], 0)
+        fixture.plan.append({"mode": "text_stop"})
+        output = runtime.rpc("open", {"providerID": "opencode", "modelID": "nonce",
+                                      "hermesTools": [READ_FILE_TOOL], "nativeTools": ["read", "grep"]})["output"]
+        session = Session(runtime, output["sessionID"])
+        self.advance(session)
+        session.until(lambda event: event["type"] == "step_ended")
+        exposed = set(self.body_tools(fixture.records[0])) & NATIVE_TOOLS
+        self.assertEqual(exposed, {"read", "grep"})
+        session.close()
+        self.assertEqual(fixture.request_count, 1)
+
     def test_native_name_collision_is_refused_before_traffic(self) -> None:
         fixture = self.fixture()
         runtime = self.runtime(TEST_COMPANION, fixture)

@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -687,6 +687,9 @@ class OpenCodeClient:
             snapshot = oc_translate.snapshot_from_openai(messages, plan=plan)
         except oc_translate.SnapshotError as error:
             raise SnapshotRefused(str(error)) from None
+        guidance = oc_translate.native_guidance(plan)
+        if guidance:
+            snapshot = replace(snapshot, system_parts=[*snapshot.system_parts, guidance])
         return plan, snapshot
 
     @staticmethod
@@ -720,7 +723,7 @@ class OpenCodeClient:
             and tool.get("hermes") is not True
         }
         unsolicited = sorted({call.name for call in result.calls if call.name in native_ids
-                              and call.name not in oc_translate.NATIVE_KEEP})
+                              and call.name not in plan.native})
         if unsolicited:
             # Native descriptors outside the catalog are never advertised and
             # never dispatched. Refuse the turn instead of returning a tool
@@ -730,7 +733,12 @@ class OpenCodeClient:
                 "use the enabled Hermes tools instead"
             )
             return self._refusal(result, record, message, affinity_reset=affinity_reset)
-        calls = self._translate_calls(result, plan)
+        try:
+            calls = self._translate_calls(result, plan, runtime)
+        except ControlRefused as error:
+            # An unrepresentable native argument: one explicit terminal
+            # refusal, no tool effect and no retried inference.
+            return self._refusal(result, record, f"{error}", affinity_reset=affinity_reset)
         return self._completion(result, record, calls, affinity_reset=affinity_reset)
 
     # -- inference ---------------------------------------------------------
@@ -784,7 +792,8 @@ class OpenCodeClient:
         plan, snapshot = self._prepare_generation(runtime, messages, tools)
         record = self._select_record(runtime, selected_model)
         self._require_transport(record)
-        session = runtime.new_session(str(record["providerID"]), str(record["id"]), plan.register)
+        session = runtime.new_session(str(record["providerID"]), str(record["id"]), plan.register,
+                                      native_tools=plan.native)
         try:
             result = session.generate(
                 snapshot=snapshot.messages,
@@ -792,6 +801,7 @@ class OpenCodeClient:
                 user_text=snapshot.user_text,
                 timeout=timeout or self.timeout,
                 hermes_tools=plan.register,
+                native_tools=plan.native,
             )
         finally:
             session.close()
@@ -874,7 +884,7 @@ class OpenCodeClient:
                     stale.close()
                 except Exception:  # noqa: BLE001 - the native session is already absent
                     LOGGER.debug("stale native session cleanup failed", exc_info=True)
-            session = runtime.new_session(provider_id, model_id, plan.register)
+            session = runtime.new_session(provider_id, model_id, plan.register, native_tools=plan.native)
             try:
                 oc_affinity.save(
                     scope["profile_home"], key, session.session_id, provider_id, model_id
@@ -901,7 +911,7 @@ class OpenCodeClient:
             session = existing
         else:
             session = runtime.new_session(
-                provider_id, model_id, plan.register, session_id=session_id
+                provider_id, model_id, plan.register, session_id=session_id, native_tools=plan.native
             )
             owner.session = session
         owner.native_session_id = session_id
@@ -971,7 +981,8 @@ class OpenCodeClient:
                 owner.session = None
                 owner.native_session_id = None
                 session = runtime.new_session(
-                    str(record["providerID"]), str(record["id"]), plan.register
+                    str(record["providerID"]), str(record["id"]), plan.register,
+                    native_tools=plan.native,
                 )
                 oc_affinity.save(
                     scope["profile_home"], owner.scope_key or "", session.session_id,
@@ -990,18 +1001,24 @@ class OpenCodeClient:
             user_text=snapshot.user_text,
             timeout=timeout or self.timeout,
             hermes_tools=plan.register,
+            native_tools=plan.native,
         )
         return self._handle_result(runtime, result, record, plan, affinity_reset=reset)
 
     create = complete
 
     @staticmethod
-    def _translate_calls(result: StepResult, plan: oc_translate.WirePlan) -> list[ToolCall]:
+    def _translate_calls(
+        result: StepResult, plan: oc_translate.WirePlan, runtime: NativeRuntime | None = None
+    ) -> list[ToolCall]:
         translated: list[ToolCall] = []
+        # Native paths resolve against the Hermes cwd; the private runtime the
+        # native env block names is never a Hermes tool target.
+        forbidden = [str(runtime.root)] if runtime is not None and runtime.root is not None else []
         for call in result.calls:
             try:
                 host_name, host_arguments = oc_translate.translate_call(
-                    call.name, call.arguments, plan=plan, enabled=set(plan.host_to_wire)
+                    call.name, call.arguments, plan=plan, forbidden_roots=forbidden
                 )
             except oc_translate.NativeTranslationError as error:
                 raise ControlRefused(f"native tool {call.name!r} cannot run: {error}") from None

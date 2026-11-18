@@ -40,11 +40,13 @@ TERMINAL = {
 
 
 class PlanTests(unittest.TestCase):
-    def test_every_hermes_schema_is_additive_and_exact(self):
+    def test_every_unreplaced_hermes_schema_is_additive_and_exact(self):
         plan = T.plan_tools([READ_FILE, TERMINAL], ["read"])
-        self.assertEqual(plan.host_to_wire, {"read_file": "read_file", "terminal": "terminal"})
-        self.assertEqual({row["name"] for row in plan.register}, {"read_file", "terminal"})
-        for row, source in zip(plan.register, (READ_FILE, TERMINAL)):
+        # read_file is replaced by native read: one name per capability.
+        self.assertEqual(plan.host_to_wire, {"terminal": "terminal"})
+        self.assertEqual(plan.native, {"read"})
+        self.assertEqual(plan.enabled, {"read_file", "terminal"})
+        for row, source in zip(plan.register, (TERMINAL,)):
             self.assertEqual(row["parameters"], source["function"]["parameters"])
             self.assertEqual(row["description"], source["function"]["description"])
             self.assertFalse(row["codemode"])
@@ -60,7 +62,7 @@ class PlanTests(unittest.TestCase):
             "name": "read", "description": "native read", "parameters": {}}}
         plan = T.plan_tools([READ_FILE, native_read], ["read"])
         self.assertEqual(plan.host_to_wire["read"], "hermes_read")
-        self.assertEqual(plan.host_to_wire["read_file"], "read_file")
+        self.assertNotIn("read_file", plan.host_to_wire)
 
     def test_read_file_unavailable_fails_before_inference(self):
         # Approved contract: never advertise the native read adapter without
@@ -72,8 +74,8 @@ class PlanTests(unittest.TestCase):
 
 
 class MappingTests(unittest.TestCase):
-    def test_native_read_is_the_only_mapping(self):
-        self.assertEqual(T.NATIVE_KEEP, frozenset({"read"}))
+    def test_native_read_mapping(self):
+        self.assertEqual(set(T.NATIVE_MAP), {"read", "write", "glob", "grep", "question", "todowrite"})
         self.assertEqual(T.translate_call("read", {"path": "a", "offset": 0, "limit": 3}), (
             "read_file", {"path": "a", "offset": 1, "limit": 3}))
         self.assertEqual(T.translate_call("read", {"path": "a"}), ("read_file", {"path": "a"}))
@@ -83,7 +85,9 @@ class MappingTests(unittest.TestCase):
     def test_read_limit_is_capped_and_validated(self):
         self.assertEqual(T.translate_call("read", {"path": "a", "limit": 99_999})[1]["limit"],
                          T.READ_LIMIT_MAX)
-        for arguments in ({"path": ""}, {"path": "a", "limit": 0},
+        # Native limit 0 means the default.
+        self.assertEqual(T.translate_call("read", {"path": "a", "limit": 0}), ("read_file", {"path": "a"}))
+        for arguments in ({"path": ""}, {"path": "a", "limit": -1},
                           {"path": "a", "extra": 1}, {"offset": 1}):
             with self.subTest(arguments=arguments), self.assertRaises(T.NativeInvalidArguments):
                 T.translate_call("read", arguments)
@@ -94,14 +98,14 @@ class MappingTests(unittest.TestCase):
 
     def test_other_native_families_have_no_translation(self):
         for name, arguments in (
-            ("write", {"path": "a", "content": "b"}),
             ("edit", {"path": "a", "oldString": "x", "newString": "y"}),
             ("shell", {"command": "pwd"}),
-            ("grep", {"pattern": "x"}),
-            ("glob", {"pattern": "*"}),
+            ("patch", {"patchText": "*** Begin Patch"}),
+            ("skill", {"id": "x"}),
             ("webfetch", {"url": "https://example.invalid"}),
-            ("question", {"questions": []}),
+            ("websearch", {"query": "x"}),
             ("subagent", {}),
+            ("experimental_image_generate", {"prompt": "x"}),
             ("execute", {"code": "1"}),
         ):
             with self.subTest(name=name):

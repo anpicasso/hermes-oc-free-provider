@@ -4,6 +4,19 @@ Notable changes to `oc-free-provider`.
 
 ## Unreleased
 
+- **Constrained native tool mappings.** Native `read`, `write`, `glob`, `grep`,
+  `question` and `todowrite` map to Hermes `read_file`, `write_file`,
+  `search_files`, `clarify` and `todo_list`. Each is advertised only while its
+  Hermes target is enabled, and the target schema is then withheld (no
+  duplicates). Unsupported options are refused, never dropped: `read` negative
+  offset, `glob` `hidden: true`, more than 5 questions or 4 options. Native
+  `read` `limit: 0` now means the default. Absolute paths into the private
+  runtime are refused, and a guidance system part states the limits and the cwd
+  rule. Native `edit`/`patch`/`shell` and every other native stay hidden by
+  ownership; genuine Hermes `patch` remains `hermes_patch`. The runtime enables
+  `experimental.todo` so `todowrite` exists. Companion `open`/`advance` accept
+  `nativeTools`.
+
 - **Upstream HTTP status reaches Hermes.** `CompletionRefused.status_code` now
   carries the 4xx/5xx the official runtime reports (companion `completion`
   outcome, OpenCode `step_failed.error.status`, `response_unverified` outcome),

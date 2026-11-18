@@ -1,7 +1,8 @@
 # Limitations and acceptance plan
 
-Status: 4.1.0. This is the current product boundary and acceptance checklist,
-not a deployment or release record.
+Status: historical 4.1.0 plan, not the current product boundary or a release
+record. See `README.md` and `TRANSLATION_API.md` for the subsequently expanded
+constrained native mappings and current hosted-acceptance limitations.
 
 ## Goal
 

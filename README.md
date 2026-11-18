@@ -77,7 +77,7 @@ allow it.
 | Provider module | `__init__.py` → `opencode_free` |
 | Vendor protocol | Chat Completions SSE inside the native OpenCode runtime |
 | Companion protocol | 5 |
-| Model-facing native tools | `read` only |
+| Model-facing native tools | `read`, `write`, `glob`, `grep`, `question`, `todowrite`, conditional on enabled Hermes targets |
 | Hermes-facing streaming | none (`supports_streaming = False`; deferred, [issue #11](https://github.com/anpicasso/hermes-oc-free-provider/issues/11)) |
 | Cost policy | free models only |
 
@@ -160,13 +160,12 @@ free. There is no paid fallback and no legacy spoofing transport.
 2. The bundled companion is loaded from the private `opencode.json` and runs
    inside that official server. It exposes authenticated JSON RPC over loopback
    and observes each primary Chat Completions SSE response non-destructively.
-3. The model-facing catalog is **native `read` plus every genuine Hermes tool
-   the session exposes**, with the host's full descriptions and schemas. Every
-   other native descriptor (edit, write, patch, shell, grep/glob, subagent,
-   webfetch/websearch, skill, question, `execute`, browser/opencode/console
-   families) is removed before the request. OpenCode executes no tool.
-4. A model-emitted native `read` is translated to an ordinary Hermes
-   `read_file` call. Hermes dispatches it through its normal loop, approvals and
+3. The model-facing catalog uses the constrained native mappings below in
+   place of their Hermes schemas, plus every other enabled genuine Hermes tool
+   with its full description and schema. All unmapped native descriptors are
+   removed before the request. OpenCode executes no tool.
+4. A model-emitted mapped native call (for example `read`) is translated to an
+   ordinary Hermes call (`read_file`). Hermes dispatches it through its normal loop, approvals and
    policy. On the next completion the canonical Hermes history is replayed as
    the native snapshot with the original wire names and arguments.
 5. Text, reasoning and tool names/arguments/call IDs come from OpenCode's own
@@ -175,26 +174,42 @@ free. There is no paid fallback and no legacy spoofing transport.
 
 ## Supported surface
 
-One native compatibility tool: `read` → Hermes `read_file`.
+Constrained native mappings, each advertised only while its Hermes target is
+enabled (the target schema is then withheld, so there are no duplicates):
 
-- `path` is required; native `offset` 0 or 1 both mean line 1; positive
-  `offset`/`limit` map to `read_file` (limit capped at 2000).
-- Negative `offset` (tail read) has no Hermes equivalent and is refused rather
-  than silently changed.
-- Full Hermes `read_file` is still advertised independently with its own schema
-  and semantics; the compatibility adapter is not a promise of every native
-  `read` behavior.
+| native | Hermes |
+|---|---|
+| `read` | `read_file` |
+| `write` | `write_file` |
+| `glob`, `grep` | `search_files` |
+| `question` | `clarify` |
+| `todowrite` | `todo_list` (the session's own store) |
 
-Every other capability (write, edit/patch, shell, search, web, delegation,
-skills, todos, browser, Python execution) comes from the genuine Hermes tools
-enabled in the session. They are advertised byte-for-byte. A Hermes tool whose
-name collides with a native registry id (for example `patch`) is advertised
-under the reversible wire alias `hermes_<name>` and never dropped.
+These are not full parity. Unsupported options are refused, never silently
+dropped (for example `read` negative offset, `glob` `hidden: true`, more than 5
+questions or 4 options). Relative paths resolve against the Hermes working
+directory; absolute paths into the private OpenCode runtime are refused. A
+system part tells the model these limits.
+
+Native `edit`, `patch`, `shell`, `skill`, `webfetch`, `websearch`, `subagent`,
+`experimental_image_generate`, `execute` and all Code Mode tools are hidden.
+Every other capability (patch, terminal, background processes, delegation, web,
+skills, browser, Python execution) comes from the genuine Hermes tools enabled
+in the session, advertised byte-for-byte. A Hermes tool whose name collides
+with a native registry id (for example `patch`) is advertised under the
+reversible wire alias `hermes_<name>` and never dropped.
 
 If `read_file` is unavailable, the provider fails before inference instead of
 advertising a compatibility read that cannot run.
 
 Option restrictions and refusals are in [`TRANSLATION_API.md`](TRANSLATION_API.md).
+
+**Hosted acceptance is catalog-dependent, not guaranteed.** In the bounded
+anonymous OpenCode 2.3.0 checks for this change, `big-pickle` completed a real
+`glob` → `grep` → `read` → `write` Hermes-local workflow and a dependent second
+turn with the file toolset. The default Hermes catalog still returned HTTP 429
+`FreeUsageLimitError`, while vanilla OpenCode answered. These mappings do not
+establish supported free-tier access or resolve that upstream rejection.
 
 ## Completion contract
 

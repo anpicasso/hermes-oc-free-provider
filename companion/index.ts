@@ -13,10 +13,10 @@
 //
 // OpenCode's own parsed tool calls remain authoritative. The gate only decides
 // whether they may be exposed to Hermes; executors are held from the moment
-// the runner calls them. Only the native `read` descriptor survives in the
-// model-facing catalog (translated by Python to Hermes `read_file`); every
-// other native tool — including JavaScript `execute` — is removed before the
-// request and refused at dispatch if a model emits it anyway.
+// the runner calls them. Only the native descriptors Python keeps for the
+// session (translated to enabled Hermes tools) survive in the model-facing
+// catalog; every other native tool — including JavaScript `execute` — is
+// removed before the request and refused at dispatch if a model emits it.
 //
 // This file is the packaged production companion: no fixture provider, no
 // `fixtureURL` option and no parser RPC. Fixture registration lives in
@@ -32,10 +32,11 @@ const RPC_ID = "hermes-oc-native"
 const COMPANION = "hermes-oc-native"
 const PROTOCOL = 5
 const EVENT_LOG_LIMIT = 512
-// Native descriptors may stay in the model-facing catalog. Everything else is
-// removed by identity: OpenCode's own `read` is the single compatibility tool,
-// and any native name a Hermes registration owns is preserved as Hermes'.
-const EXPOSED_NATIVE = new Set(["read"])
+// Native descriptors Python may keep in the model-facing catalog (each mapped
+// to an enabled Hermes tool by oc_translate.NATIVE_MAP). Python names the exact
+// subset per generation (`nativeTools`); everything else is removed by
+// identity, and a native name a Hermes registration owns stays Hermes'.
+const TRANSLATED_NATIVE = new Set(["read", "write", "glob", "grep", "question", "todowrite"])
 
 // Bounds for the response parser. Everything else is counters only, so a
 // hostile or huge stream cannot grow plugin memory without limit.
@@ -60,7 +61,7 @@ const CLOSED_TOMBSTONES = 128
 // refusal and Hermes never receives JS as a Python program.
 const EXECUTE_UNSUPPORTED =
   "native JavaScript execute is unsupported; use the enabled Hermes Python execute_code tool"
-// Any native tool outside EXPOSED_NATIVE is never advertised. A model that
+// Any native tool outside the session's `nativeTools` is never advertised. A model that
 // emits one anyway gets an explicit refusal, never a host side effect.
 const nativeRefusal = (name: string) =>
   name === "execute"
@@ -118,6 +119,9 @@ type Session = {
   pending: Map<string, PendingCall>
   calls: Map<string, Array<{ callID: string; name: string; input: unknown; native?: unknown }>>
   names: Map<string, string>
+  // Native descriptors kept for this session; undefined = legacy default
+  // (`read` while Hermes `read_file` is registered).
+  nativeTools?: Set<string>
   stepGeneration: Map<string, number>
   events: Array<Record<string, any>>
   seq: number
@@ -539,6 +543,8 @@ const RpcContract = Rpc.define({
               additionalProperties: false,
             },
           },
+          // Native descriptors to keep (subset of TRANSLATED_NATIVE).
+          nativeTools: { type: "array", items: { type: "string" } },
         },
         required: ["providerID", "modelID"],
         additionalProperties: false,
@@ -576,6 +582,8 @@ const RpcContract = Rpc.define({
               additionalProperties: false,
             },
           },
+          // Native descriptors to keep (subset of TRANSLATED_NATIVE).
+          nativeTools: { type: "array", items: { type: "string" } },
         },
         required: ["sessionID", "generation"],
         additionalProperties: false,
@@ -812,6 +820,24 @@ export default Plugin.define({
         }
       }
 
+    const keptNative = (session: Session) =>
+      session.nativeTools ?? new Set(hermesDefinitions.has("read_file") ? ["read"] : [])
+    // Validate a requested native subset against the live registry: only a
+    // translated, forwarded native descriptor that Hermes does not own.
+    const nativeSubset = async (names: unknown): Promise<Set<string> | undefined> => {
+      if (names === undefined) return undefined
+      if (!Array.isArray(names)) throw new Error("hermes-oc-native: nativeTools must be an array")
+      const ids = new Set((await ctx.tool.list()).map((tool: any) => String(tool.id)))
+      const kept = new Set<string>()
+      for (const raw of names) {
+        const name = String(raw)
+        if (!TRANSLATED_NATIVE.has(name) || !ids.has(name) || hermesDefinitions.has(name))
+          throw new Error(`hermes-oc-native: native tool cannot be exposed: ${name}`)
+        kept.add(name)
+      }
+      return kept
+    }
+
     // Every native tool gets the waiting executor; definitions are untouched.
     // Built-in tools register after this plugin's setup, so re-reconcile at
     // every control point instead of trusting one startup snapshot.
@@ -972,7 +998,7 @@ export default Plugin.define({
       const session = sessions.get(String(event.sessionID))
       if (!session) throw new Error(`hermes-oc-native: unscoped session ${event.sessionID}`)
       const name = String(event.tool)
-      if (hermesDefinitions.has(name) || EXPOSED_NATIVE.has(name)) {
+      if (hermesDefinitions.has(name) || keptNative(session).has(name)) {
         if (!forwarded.has(name)) throw new Error(`hermes-oc-native: unscoped tool refused: ${name}`)
         return
       }
@@ -1034,11 +1060,12 @@ export default Plugin.define({
       // is preserved (Python owns the reversible wire alias).
       const exposed = event.tools as Record<string, unknown>
       const removed: string[] = []
-      // Native `read` is advertised only while Hermes can actually run it.
-      const compatReady = hermesDefinitions.has("read_file")
+      // A native descriptor is advertised only when Python kept it for this
+      // generation (its Hermes target is enabled).
+      const kept = keptNative(session)
       for (const name of Object.keys(exposed)) {
         if (hermesDefinitions.has(name)) continue
-        if (EXPOSED_NATIVE.has(name) && compatReady) continue
+        if (kept.has(name)) continue
         delete exposed[name]
         removed.push(name)
       }
@@ -1362,9 +1389,12 @@ export default Plugin.define({
             info = created?.data ?? created
             createdNative = true
           }
+          let nativeTools: Set<string> | undefined
           try {
             // Exact current catalog: undefined/empty removes prior Hermes
             // registrations so a disabled tool cannot remain callable.
+            // Validate the native subset first so a refusal leaves the registry untouched.
+            nativeTools = await nativeSubset(input.nativeTools)
             await registerHermesTools(Array.isArray(input.hermesTools) ? input.hermesTools : [])
           } catch (error) {
             if (createdNative) {
@@ -1400,6 +1430,7 @@ export default Plugin.define({
             pending: new Map(),
             calls: new Map(),
             names: new Map(),
+            nativeTools,
             stepGeneration: new Map(),
             events: [],
             seq: 0,
@@ -1470,13 +1501,14 @@ export default Plugin.define({
         // Late tools enter on the next generation; pure additions are allowed
         // while this session advertises the previous registry. An omitted list
         // leaves the registry untouched (direct-protocol callers).
-        if (Array.isArray(input.hermesTools)) {
-          try {
-            await registerHermesTools(input.hermesTools, session.id)
-          } catch (error) {
-            return context.error("invalid_state", String((error as Error)?.message ?? error), {})
-          }
+        let nativeTools = session.nativeTools
+        try {
+          if (input.nativeTools !== undefined) nativeTools = await nativeSubset(input.nativeTools)
+          if (Array.isArray(input.hermesTools)) await registerHermesTools(input.hermesTools, session.id)
+        } catch (error) {
+          return context.error("invalid_state", String((error as Error)?.message ?? error), {})
         }
+        session.nativeTools = nativeTools
         session.generation = input.generation
         session.settled = false
         session.rejectReason = undefined

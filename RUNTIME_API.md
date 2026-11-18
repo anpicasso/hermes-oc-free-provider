@@ -348,14 +348,22 @@ raise `ControlRefused` **at create time**, even through the lazy
 occurs. That keeps auxiliary/Relay callers from receiving an object they cannot
 iterate. Iterating a non-stream completion raises the same clear refusal.
 
-The enabled Hermes tools are advertised as additive tools with their full
-schemas. Only the native `read` compatibility descriptor remains; if `read_file`
-is not among the supplied tools, the client raises `ControlRefused` before
-inference instead of advertising an unusable read. Every native registry id is
+Native `read`, `write`, `glob`, `grep`, `question` and `todowrite` are
+advertised only while their Hermes target (`read_file`, `write_file`,
+`search_files`, `clarify`, `todo_list`) is enabled, and that target schema is
+then withheld. The client sends the kept set as `nativeTools` to `open` and
+`advance`. Every other enabled Hermes tool is advertised with its full schema.
+If `read_file` is not among the supplied tools, the client raises
+`ControlRefused` before inference. The runtime config sets
+`experimental.todo: true` so the pinned binary registers `todowrite`. Every native registry id is
 reserved, so a Hermes tool with a colliding name is advertised as
 `hermes_<name>` and mapped back to its Hermes identity on dispatch.
 
-Native calls outside `NATIVE_KEEP` are never dispatched. If a model emits one,
+Mapped native calls whose arguments cannot be represented raise
+`ControlRefused` before any effect. Absolute paths into the private runtime root
+are refused; relative paths resolve against the Hermes working directory, and a
+guidance system part tells the model so. Native calls outside the kept set are
+never dispatched. If a model emits one,
 the client returns a terminal refusal completion naming the tool, with no tool
 call, no effect and no extra inference. Native `execute` keeps its dedicated
 refusal message.

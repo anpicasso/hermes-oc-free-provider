@@ -1,10 +1,12 @@
 """Stock-Hermes translation for the OpenCode-native provider.
 
-One native compatibility tool only: OpenCode's ``read`` is mapped to Hermes
-``read_file``. Every other capability comes from the genuine Hermes schemas the
-current session exposes; those are advertised byte-for-byte with a reversible
-wire alias when a Hermes name collides with the retained native descriptor.
-Nothing executes here.
+A constrained set of native descriptors (``NATIVE_MAP``: read, write, glob,
+grep, question, todowrite) is mapped to the Hermes tool that runs it, and only
+while that tool is enabled; the replaced Hermes schema is then not advertised.
+Every other capability comes from the genuine Hermes schemas the current
+session exposes, byte-for-byte, with a reversible wire alias on a native name
+collision. Unsupported native options are refused, never dropped. Nothing
+executes here.
 
 Call provenance travels in the OpenAI call id as ``ocn1.<wire>.<tag>.<id>``.
 The wire name is the name the model actually emitted; a compressed payload is
@@ -20,15 +22,22 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import urllib.parse
 import zlib
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 COMPAT_TOOL = "read_file"
-NATIVE_KEEP = frozenset({"read"})
 NATIVE_CARRIER = "opencode-free.native_assistant"
 READ_LIMIT_MAX = 2000
+SEARCH_LIMIT_DEFAULT = 100  # native glob/grep default; Hermes search_files defaults to 50
+# Hermes clarify/todo_list bounds (tools/clarify_tool.py, tools/todo_tool.py).
+CLARIFY_MAX_QUESTIONS = 5
+CLARIFY_MAX_CHOICES = 4
+TODO_MAX_ITEMS = 256
+TODO_MAX_CONTENT = 4000
+TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
 MAX_WIRE_NAME = 64
 CALL_PREFIX = "ocn1"
 MAX_CALL_ARGUMENT_BYTES = 1024 * 1024
@@ -86,17 +95,33 @@ def _integer(value: Any, field_name: str, *, minimum: int | None = None, maximum
     return value
 
 
-def _map_read(arguments: dict) -> tuple[str, dict]:
-    """Native `read` -> Hermes `read_file`.
+def _path(arguments: dict, key: str, forbidden: Iterable[str], *, required: bool = True) -> str | None:
+    """A native path argument; absolute paths into the private runtime are refused."""
+    value = _string(arguments, key, required=required)
+    if value is not None and os.path.isabs(os.path.expanduser(value)):
+        real = os.path.realpath(os.path.expanduser(value))
+        for root in forbidden:
+            base = os.path.realpath(root)
+            if real == base or real.startswith(base.rstrip(os.sep) + os.sep):
+                raise NativeUnsupported(
+                    f"{key!r} points into the private OpenCode runtime; native paths resolve "
+                    "against the Hermes working directory"
+                )
+    return value
 
-    Supported: absolute/relative ``path``, 0-or-1-based ``offset`` and a
-    positive ``limit``. Native ``offset < 0`` (tail read) has no Hermes
-    equivalent and is refused rather than silently truncated. ``limit`` above
-    ``read_file``'s own cap is clamped; full Hermes ``read_file`` stays
-    available independently with its own schema and semantics.
-    """
+
+def _boolean(arguments: dict, key: str) -> bool | None:
+    value = arguments.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise NativeInvalidArguments(f"{key!r} must be a boolean")
+    return value
+
+
+def _map_read(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    """Native ``read`` -> ``read_file``. Native ``limit: 0`` means the default;
+    ``offset < 0`` (tail read) has no Hermes equivalent and is refused."""
     _strict(arguments, {"path", "offset", "limit"}, "read")
-    mapped: dict[str, Any] = {"path": _string(arguments, "path")}
+    mapped: dict[str, Any] = {"path": _path(arguments, "path", forbidden)}
     if arguments.get("offset") is not None:
         value = _integer(arguments["offset"], "read offset")
         if value < 0:
@@ -104,8 +129,131 @@ def _map_read(arguments: dict) -> tuple[str, dict]:
         # Native 0 and 1 both mean the first line; read_file is 1-based.
         mapped["offset"] = max(1, value)
     if arguments.get("limit") is not None:
-        mapped["limit"] = min(_integer(arguments["limit"], "read limit", minimum=1), READ_LIMIT_MAX)
-    return COMPAT_TOOL, mapped
+        limit = _integer(arguments["limit"], "read limit", minimum=0)
+        if limit:
+            mapped["limit"] = min(limit, READ_LIMIT_MAX)
+    return mapped
+
+
+def _map_write(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    _strict(arguments, {"path", "content"}, "write")
+    return {"path": _path(arguments, "path", forbidden),
+            "content": _string(arguments, "content", allow_empty=True)}
+
+
+def _map_glob(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    _strict(arguments, {"pattern", "path", "hidden", "limit"}, "glob")
+    if _boolean(arguments, "hidden"):
+        raise NativeUnsupported("native glob hidden:true has no Hermes equivalent (hidden paths are skipped)")
+    mapped: dict[str, Any] = {"pattern": _string(arguments, "pattern"), "target": "files"}
+    if arguments.get("path") is not None:
+        mapped["path"] = _path(arguments, "path", forbidden)
+    limit = arguments.get("limit")
+    mapped["limit"] = SEARCH_LIMIT_DEFAULT if limit is None else _integer(limit, "glob limit", minimum=1)
+    return mapped
+
+
+# ponytail: escape only the regex metacharacters ripgrep honours outside a class.
+_REGEX_META = frozenset("\\.^$|?*+()[]{}")
+
+
+def _map_grep(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    _strict(arguments, {"pattern", "path", "include", "literal", "caseSensitive", "limit"}, "grep")
+    pattern = _string(arguments, "pattern")
+    if _boolean(arguments, "literal"):
+        pattern = "".join("\\" + char if char in _REGEX_META else char for char in pattern)
+    if _boolean(arguments, "caseSensitive") is False:
+        pattern = "(?i)" + pattern
+    mapped: dict[str, Any] = {"pattern": pattern, "target": "content"}
+    if arguments.get("path") is not None:
+        mapped["path"] = _path(arguments, "path", forbidden)
+    if arguments.get("include") is not None:
+        mapped["file_glob"] = _string(arguments, "include")
+    limit = arguments.get("limit")
+    mapped["limit"] = SEARCH_LIMIT_DEFAULT if limit is None else _integer(limit, "grep limit", minimum=1)
+    return mapped
+
+
+def _map_question(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    """Native ``question`` -> ``clarify``. Headers and option descriptions are
+    folded into the question text (never dropped); the exact native call is
+    kept by call-id provenance. Over-limit forms are refused, never truncated."""
+    _strict(arguments, {"questions"}, "question")
+    questions = arguments.get("questions")
+    if not isinstance(questions, list) or not questions:
+        raise NativeInvalidArguments("'questions' must be a non-empty array")
+    if len(questions) > CLARIFY_MAX_QUESTIONS:
+        raise NativeUnsupported(f"Hermes clarify accepts at most {CLARIFY_MAX_QUESTIONS} questions per call")
+    mapped = []
+    for index, item in enumerate(questions):
+        if not isinstance(item, dict):
+            raise NativeInvalidArguments(f"questions[{index}] must be an object")
+        _strict(item, {"question", "header", "options", "multiple"}, "question")
+        text = _string(item, "question")
+        header = _string(item, "header", required=False, allow_empty=True)
+        options = item.get("options", [])
+        multiple = _boolean(item, "multiple")
+        if not isinstance(options, list):
+            raise NativeInvalidArguments(f"questions[{index}].options must be an array")
+        if len(options) > CLARIFY_MAX_CHOICES:
+            raise NativeUnsupported(f"Hermes clarify accepts at most {CLARIFY_MAX_CHOICES} options per question")
+        labels, notes = [], []
+        for option in options:
+            if not isinstance(option, dict):
+                raise NativeInvalidArguments(f"questions[{index}].options entries must be objects")
+            _strict(option, {"label", "description"}, "question option")
+            label = _string(option, "label")
+            if not label.strip():
+                raise NativeInvalidArguments(f"questions[{index}] option label must not be blank")
+            labels.append(label)
+            description = _string(option, "description", required=False, allow_empty=True)
+            if description:
+                notes.append(f"- {label}: {description}")
+        body = "\n\n".join(part for part in (header, text, "\n".join(notes)) if part)
+        entry: dict[str, Any] = {"question": body}
+        if labels:
+            entry["choices"] = labels
+            if multiple:
+                entry["multi_select"] = True
+        mapped.append(entry)
+    return {"questions": mapped}
+
+
+def _map_todowrite(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    """Native ``todowrite`` (replace-only) -> ``todo_list`` in the session's own
+    Hermes store, with positional ids. Hermes caps are refused, not truncated."""
+    _strict(arguments, {"todos"}, "todowrite")
+    todos = arguments.get("todos")
+    if not isinstance(todos, list):
+        raise NativeInvalidArguments("'todos' must be an array")
+    if len(todos) > TODO_MAX_ITEMS:
+        raise NativeUnsupported(f"Hermes todo_list keeps at most {TODO_MAX_ITEMS} items")
+    mapped = []
+    for index, item in enumerate(todos):
+        if not isinstance(item, dict):
+            raise NativeInvalidArguments(f"todos[{index}] must be an object")
+        _strict(item, {"content", "status"}, "todowrite")
+        content = _string(item, "content")
+        if not content.strip():
+            raise NativeInvalidArguments(f"todos[{index}].content must not be blank")
+        if len(content.strip()) > TODO_MAX_CONTENT:
+            raise NativeUnsupported(f"Hermes todo_list caps item content at {TODO_MAX_CONTENT} characters")
+        status = item.get("status")
+        if status not in TODO_STATUSES:
+            raise NativeInvalidArguments(f"todos[{index}].status must be one of {', '.join(TODO_STATUSES)}")
+        mapped.append({"id": str(index + 1), "content": content, "status": status})
+    return {"todos": mapped, "merge": False}
+
+
+# native name -> (Hermes tool, argument mapper). Everything else stays hidden.
+NATIVE_MAP: dict[str, tuple[str, Any]] = {
+    "read": ("read_file", _map_read),
+    "write": ("write_file", _map_write),
+    "glob": ("search_files", _map_glob),
+    "grep": ("search_files", _map_grep),
+    "question": ("clarify", _map_question),
+    "todowrite": ("todo_list", _map_todowrite),
+}
 
 
 def translate_call(
@@ -114,13 +262,14 @@ def translate_call(
     *,
     plan: "WirePlan | None" = None,
     enabled: Iterable[str] | None = None,
+    forbidden_roots: Iterable[str] = (),
 ) -> tuple[str, dict]:
     """Map one model-emitted native call to an ordinary Hermes call.
 
-    Nothing executes here. Native ``read`` maps to ``read_file``. A registered
-    Hermes wire name forwards unchanged. Anything else keeps a name Hermes does
-    not own (or a sentinel when it collides), so stock dispatch can never run an
-    unrelated tool by accident.
+    Nothing executes here. A mapped native name becomes its Hermes tool. A
+    registered Hermes wire name forwards unchanged. Anything else keeps a name
+    Hermes does not own (or a sentinel when it collides), so stock dispatch can
+    never run an unrelated tool by accident.
     """
     if not isinstance(native_name, str) or not native_name:
         raise NativeInvalidArguments("native tool name must be a non-empty string")
@@ -130,24 +279,29 @@ def translate_call(
         arguments = json.loads(json.dumps(arguments, allow_nan=False))
     except (TypeError, ValueError) as error:
         raise NativeInvalidArguments(f"native tool {native_name!r} arguments are not JSON") from error
-
-    if native_name == "read":
-        host_name, mapped = _map_read(arguments)
-        if enabled is not None and host_name not in set(enabled):
-            # The model asked for the compatibility read while Hermes read_file
-            # is disabled. Give stock dispatch an unknown name; never run a
-            # different tool in its place.
-            return "oc_unsupported_read", arguments
-        return host_name, mapped
+    enabled = set(enabled) if enabled is not None else (plan.enabled if plan is not None else None)
 
     # An additive Hermes schema the model called directly keeps its identity
     # and arguments byte-for-byte.
     if plan is not None and native_name in plan.wire_to_host:
         return plan.wire_to_host[native_name], arguments
+    # A withheld Hermes name (for example from older history) is still an
+    # enabled Hermes tool; it dispatches under its own identity.
+    if plan is not None and native_name in plan.replaced:
+        return native_name, arguments
 
-    # Any other native name (execute, write, edit, shell, subagent, ...) has no
+    if native_name in NATIVE_MAP and (plan is None or native_name in plan.native):
+        host_name, mapper = NATIVE_MAP[native_name]
+        mapped = mapper(arguments, forbidden_roots)
+        if enabled is not None and host_name not in enabled:
+            # The target is disabled: give stock dispatch an unknown name;
+            # never run a different tool in its place.
+            return f"oc_unsupported_{native_name}", arguments
+        return host_name, mapped
+
+    # Any other native name (execute, edit, patch, shell, subagent, ...) has no
     # mapping. A colliding Hermes name gets a sentinel so it cannot run.
-    if enabled is not None and native_name in set(enabled):
+    if enabled is not None and native_name in enabled:
         return f"oc_unsupported_{native_name}", arguments
     return native_name, arguments
 
@@ -155,12 +309,21 @@ def translate_call(
 # ---------------------------------------------------------------------------
 # Hermes -> native (lossless inverse)
 # ---------------------------------------------------------------------------
+def _inverse_write(arguments: dict) -> dict:
+    return dict(arguments)
+
+
 def _inverse_read(arguments: dict) -> dict:
     return {key: value for key, value in (
         ("path", arguments.get("path")),
         ("offset", arguments.get("offset")),
         ("limit", arguments.get("limit")),
     ) if value is not None}
+
+
+# Exact inverses only; every other mapped call carries its native arguments in
+# the call-id payload.
+_INVERSE = {"read": _inverse_read, "write": _inverse_write}
 
 
 def _canonical(value: Any) -> str:
@@ -195,7 +358,7 @@ def _unpayload(value: str) -> dict:
 
 def encode_call_id(native_name: str, native_arguments: dict, host_arguments: dict, original_id: str) -> str:
     """Return a deterministic call id that carries wire-name (and lossy args) provenance."""
-    inverse = _inverse_read if native_name == "read" else None
+    inverse = _INVERSE.get(native_name)
     recovered = inverse(host_arguments) if inverse is not None else host_arguments
     tag = "v" if _canonical(recovered) == _canonical(native_arguments) else f"p{_payload(native_arguments)}"
     # Names may contain '.', so only the call id's own delimiter is literal.
@@ -282,6 +445,12 @@ class WirePlan:
     register: list[dict] = field(default_factory=list)
     host_to_wire: dict[str, str] = field(default_factory=dict)
     wire_to_host: dict[str, str] = field(default_factory=dict)
+    # Native descriptors this request keeps (each has an enabled Hermes target).
+    native: frozenset = frozenset()
+    # Every enabled Hermes tool, including ones replaced by a native descriptor.
+    enabled: frozenset = frozenset()
+    # Enabled Hermes tools withheld from the catalog because a native replaces them.
+    replaced: frozenset = frozenset()
 
     def wire_for(self, host_name: str) -> str:
         return self.host_to_wire.get(host_name, host_name)
@@ -301,14 +470,18 @@ def _function(tool: Any) -> dict | None:
     return None
 
 
-def plan_tools(tools: Iterable[dict] | None, native_names: Iterable[str] = NATIVE_KEEP) -> WirePlan:
-    """Turn the enabled Hermes schemas into additive, collision-free wire tools.
+def plan_tools(tools: Iterable[dict] | None, native_names: Iterable[str] = ("read",)) -> WirePlan:
+    """Choose the model-facing catalog for one request.
 
-    Refuses before inference when ``read_file`` is absent: the native ``read``
-    descriptor is only advertised because Hermes can actually run it.
+    A native descriptor from ``NATIVE_MAP`` is kept only when OpenCode
+    registered it and its Hermes target is enabled; that Hermes schema is then
+    not registered (one name per capability). A Hermes target shared by several
+    natives (``search_files`` <- glob + grep) is replaced only when all of them
+    are available. Every other enabled Hermes schema is registered
+    byte-for-byte, with a reversible alias when it collides with a native name.
+    Refuses before inference when ``read_file`` is absent.
     """
     native = {str(name) for name in native_names if isinstance(name, str) and name}
-    plan = WirePlan()
     functions: list[dict] = []
     seen: set[str] = set()
     for tool in tools or []:
@@ -325,16 +498,25 @@ def plan_tools(tools: Iterable[dict] | None, native_names: Iterable[str] = NATIV
         seen.add(host)
         functions.append({"name": host, "description": description, "parameters": parameters})
 
-    hosts = {function["name"] for function in functions}
-    if COMPAT_TOOL not in hosts:
+    if COMPAT_TOOL not in seen:
         raise CompatibilityUnavailable(
             "Hermes read_file is unavailable in this session, so the native read "
             "compatibility adapter cannot be advertised; enable the file toolset"
         )
-
+    replaced = {
+        host for host in {target for target, _ in NATIVE_MAP.values()} & seen
+        if all(name in native for name, (target, _) in NATIVE_MAP.items() if target == host)
+    }
+    plan = WirePlan(
+        native=frozenset(name for name, (target, _) in NATIVE_MAP.items() if target in replaced),
+        enabled=frozenset(seen),
+        replaced=frozenset(replaced),
+    )
     taken = set(native)
     for function in functions:
         host = function["name"]
+        if host in replaced:
+            continue
         wire = host
         if wire in taken:
             wire = f"hermes_{host}"
@@ -354,6 +536,28 @@ def plan_tools(tools: Iterable[dict] | None, native_names: Iterable[str] = NATIV
         plan.wire_to_host[wire] = host
         taken.add(wire)
     return plan
+
+
+def native_guidance(plan: WirePlan) -> str | None:
+    """One system part stating the limits of the native descriptors in use."""
+    if not plan.native:
+        return None
+    lines = [
+        "Native OpenCode tools in this session are executed by Hermes. Relative paths resolve against the "
+        "Hermes current working directory, not the private OpenCode runtime directory named in the "
+        "environment block; paths inside that runtime directory are refused. Limits:",
+    ]
+    notes = {
+        "read": "read: Hermes text/document extraction, not directory listings or image attachments; offset must be >= 0; limit 0 = default, max 2000.",
+        "write": "write: an existing file must be read first in this session; Hermes path guards apply.",
+        "glob": "glob: hidden:true is refused; hidden and ignored paths are skipped.",
+        "grep": "grep: hidden and ignored paths are skipped.",
+        "question": f"question: at most {CLARIFY_MAX_QUESTIONS} questions and {CLARIFY_MAX_CHOICES} options each; headers and option descriptions are shown inside the question text; the result is Hermes clarify JSON.",
+        "todowrite": f"todowrite: replaces the whole list (max {TODO_MAX_ITEMS} items); an in_progress item may be moved before earlier pending ones; the result is Hermes todo_list JSON.",
+    }
+    lines += [f"- {notes[name]}" for name in NATIVE_MAP if name in plan.native]
+    lines.append("Native edit, patch and shell are not available. Use the advertised Hermes editing and terminal tools when enabled.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -577,8 +781,8 @@ def snapshot_from_openai(messages: Iterable[dict], *, plan: WirePlan | None = No
                     arguments = native_arguments
                     if arguments is None:
                         arguments = _arguments(function.get("arguments"), call_id)
-                        if wire == "read":
-                            arguments = _inverse_read(arguments)
+                        if wire in _INVERSE:
+                            arguments = _INVERSE[wire](arguments)
                 else:
                     # History from another provider (or an older turn): map the
                     # host name back to the wire name where a plan exists.
@@ -606,7 +810,21 @@ def snapshot_from_openai(messages: Iterable[dict], *, plan: WirePlan | None = No
             seen_results.add(call_id)
             wire = call_names[call_id]
             text = _tool_content(message.get("content"))
-            if message.get("is_error"):
+            failed = bool(message.get("is_error"))
+            if wire in NATIVE_MAP:
+                # Hermes handlers commonly return errors inside JSON without
+                # setting the outer is_error flag. Do not replay them as success.
+                try:
+                    body = json.loads(text)
+                except (ValueError, TypeError):
+                    body = None
+                if isinstance(body, dict):
+                    failed = failed or bool(body.get("error")) or body.get("success") is False
+                    if wire == "question" and body.get("outcome") in {
+                        "cancelled", "timed_out", "undelivered",
+                    }:
+                        failed = True
+            if failed:
                 result = {"type": "error", "value": text or "tool failed"}
             else:
                 result = {"type": "text", "value": text}

@@ -667,7 +667,9 @@ class RetainedRuntimeTests(unittest.TestCase):
             if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
         }
         self.assertIn("late_affinity_tool", tools)
-        self.assertIn("read_file", tools)
+        # read_file is replaced by its native `read` descriptor (no duplicate).
+        self.assertIn("read", tools)
+        self.assertNotIn("read_file", tools)
         self.assertEqual(self._headers(), [self._row()[2], self._row()[2]])
 
     def test_completion_has_no_invented_wire_id_and_mapping_matches_official_shape(self) -> None:

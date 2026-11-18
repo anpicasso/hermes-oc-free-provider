@@ -388,10 +388,28 @@ class CompletionTests(RuntimeCase):
         self.assertEqual(completion.usage.completion_tokens, 0)
         self.assertEqual(completion.usage.total_tokens, 0)
 
-    def test_native_read_is_returned_then_fresh_snapshot_continues(self) -> None:
+    def outside_marker(self, name: str) -> Path:
+        # Native paths into the private runtime root are refused by design.
+        root = helpers.root_for(f"{self._testMethodName}-outside")
+        self._roots.append(root)
+        return root / name
+
+    def test_native_read_into_runtime_root_is_refused_without_effect(self) -> None:
         fixture = self.fixture(["native_read"])
         runtime = self.runtime(fixture)
         marker = self.marker(runtime)
+        marker.write_text("private", encoding="utf-8")
+        fixture.marker = str(marker)
+        completion = self.client(runtime).complete(
+            messages=[{"role": "user", "content": "read the marker"}], tools=[helpers.READ_FILE_TOOL])
+        self.assertEqual(completion.tool_calls, [])
+        self.assertIn("private OpenCode runtime", completion.text)
+        self.assertEqual(fixture.request_count, 1)
+
+    def test_native_read_is_returned_then_fresh_snapshot_continues(self) -> None:
+        fixture = self.fixture(["native_read"])
+        runtime = self.runtime(fixture)
+        marker = self.outside_marker("read.txt")
         marker.write_text("native read payload", encoding="utf-8")
         fixture.marker = str(marker)
         client = self.client(runtime)
@@ -427,7 +445,7 @@ class CompletionTests(RuntimeCase):
     def test_finish_reason_with_argument_fragment_is_assembled(self) -> None:
         fixture = self.fixture(["tool_call_finish_with_arguments"])
         runtime = self.runtime(fixture)
-        marker = self.marker(runtime)
+        marker = self.outside_marker("after.txt")
         marker.write_text("payload", encoding="utf-8")
         fixture.marker = str(marker)
         client = self.client(runtime)

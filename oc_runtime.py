@@ -566,6 +566,9 @@ class NativeRuntime:
             "plugins": plugins,
             "compaction": {"auto": False},
             "snapshots": False,
+            # Registers native `todowrite` (translated to Hermes todo_list and
+            # advertised only while that tool is enabled).
+            "experimental": {"todo": True},
         }
         for key, value in self.config_overrides.items():
             config[key] = value
@@ -874,6 +877,7 @@ class NativeRuntime:
         hermes_tools: list[dict] | None = None,
         *,
         session_id: str | None = None,
+        native_tools: Iterable[str] | None = None,
     ) -> "Session":
         self._guard_alive()
         if not isinstance(provider_id, str) or not provider_id or not isinstance(model_id, str) or not model_id:
@@ -881,6 +885,8 @@ class NativeRuntime:
         payload: dict[str, Any] = {"providerID": provider_id, "modelID": model_id}
         if hermes_tools is not None:
             payload["hermesTools"] = hermes_tools
+        if native_tools is not None:
+            payload["nativeTools"] = sorted(native_tools)
         if session_id is not None:
             if not isinstance(session_id, str) or not session_id:
                 raise SessionRefused("session_id must be a non-empty string when supplied")
@@ -1120,6 +1126,7 @@ class Session:
         user_text: str,
         timeout: float = 60.0,
         hermes_tools: list[dict] | None = None,
+        native_tools: Iterable[str] | None = None,
     ) -> dict:
         self._guard()
         generation = self.generation + 1
@@ -1132,6 +1139,8 @@ class Session:
         }
         if hermes_tools is not None:
             payload["hermesTools"] = hermes_tools
+        if native_tools is not None:
+            payload["nativeTools"] = sorted(native_tools)
         output = self.runtime.rpc("advance", payload, timeout=timeout)
         self.generation = generation
         # Anything emitted before the authorization belongs to an older
@@ -1301,6 +1310,7 @@ class Session:
         user_text: str,
         timeout: float = 120.0,
         hermes_tools: list[dict] | None = None,
+        native_tools: Iterable[str] | None = None,
     ) -> StepResult:
         """Issue one generation permit and return only a validated completion."""
         self._guard()
@@ -1314,6 +1324,7 @@ class Session:
             user_text=user_text,
             timeout=min(60.0, timeout),
             hermes_tools=hermes_tools,
+            native_tools=native_tools,
         )
         generation = self.generation
 

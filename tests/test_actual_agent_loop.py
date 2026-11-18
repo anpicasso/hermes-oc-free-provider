@@ -45,7 +45,8 @@ from tools.registry import registry  # noqa: E402
 DEFERRED_TOOL = "hermes_agentloop_deferred"
 WANTED = ["file", "terminal", "clarify"]
 DISABLED = ["delegation", "web", "browser", "code_execution", "image_gen", "tts", "vision"]
-EXPOSED_NATIVE = {"read"}
+# Native descriptors kept for WANTED (file + clarify); todowrite needs `todo`.
+EXPOSED_NATIVE = {"read", "write", "glob", "grep", "question"}
 
 
 def _text(content) -> str:
@@ -81,6 +82,27 @@ class AgentFixture(Fixture):
         if mode == "native_write":
             yield from self._tool_events(model, "call_write_1", "write",
                                          {"path": self.marker, "content": "fixture-native"})
+            return
+        if mode == "native_edit":
+            yield from self._tool_events(model, "call_edit_1", "edit",
+                                         {"path": self.marker, "oldString": "x", "newString": "y"})
+            return
+        if mode == "native_grep":
+            yield from self._tool_events(model, "call_grep_1", "grep",
+                                         {"pattern": "a.b(", "literal": True, "path": self.marker})
+            return
+        if mode == "native_glob_hidden":
+            yield from self._tool_events(model, "call_glob_1", "glob",
+                                         {"pattern": "*", "hidden": True, "path": self.marker})
+            return
+        if mode == "native_question":
+            yield from self._tool_events(model, "call_q_1", "question", {"questions": [{
+                "question": "Pick one", "header": "Choice",
+                "options": [{"label": "alpha", "description": "first"}, {"label": "beta", "description": ""}]}]})
+            return
+        if mode == "native_todowrite":
+            yield from self._tool_events(model, "call_todo_1", "todowrite",
+                                         {"todos": [{"content": "plan", "status": "in_progress"}]})
             return
         if mode == "native_read":
             yield from self._tool_events(model, "call_read_1", "read", {"path": self.marker})
@@ -242,10 +264,14 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(_assistant_calls(self.fixture), ["read"])
         self.assertEqual(self.fixture.request_count, 2)
         tools = _outgoing_tools(self.fixture, 0)
-        self.assertEqual({name for name in tools if name in EXPOSED_NATIVE}, {"read"})
-        for forbidden in ("write", "edit", "shell", "execute", "subagent", "grep", "glob", "patch"):
+        self.assertEqual({name for name in tools if name in EXPOSED_NATIVE}, EXPOSED_NATIVE)
+        for forbidden in ("edit", "shell", "execute", "subagent", "patch", "skill", "webfetch",
+                          "websearch", "todowrite", "experimental_image_generate"):
             self.assertNotIn(forbidden, tools, f"native {forbidden} was advertised")
-        self.assertIn("read_file", tools, "the genuine Hermes read_file schema is missing")
+        for replaced in ("read_file", "write_file", "search_files", "clarify"):
+            self.assertNotIn(replaced, tools, f"{replaced} duplicated beside its native descriptor")
+        self.assertIn("hermes_patch", tools, "genuine Hermes patch was hidden")
+        self.assertIn("terminal", tools)
 
     def test_native_read_offset_and_limit_are_translated(self):
         marker = self.root / "offset.txt"
@@ -254,7 +280,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("two", str(result["final_response"]))
         self.assertEqual(_assistant_calls(self.fixture), ["read"])
 
-    def test_direct_hermes_read_file_is_additive_and_keeps_its_wire_name(self):
+    def test_direct_hermes_read_file_still_dispatches_under_its_own_name(self):
         marker = self.root / "direct-read.txt"
         marker.write_text("direct payload", encoding="utf-8")
         result = self._run("direct_read_file", marker=str(marker))
@@ -307,7 +333,8 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("fixture text", completion.text)
         second = _outgoing_tools(self.fixture, 1)
         self.assertIn(DEFERRED_TOOL, second, "a newly available schema did not enter the next request")
-        self.assertIn("read_file", second)
+        self.assertIn("read", second)
+        self.assertNotIn("read_file", second)
         self.assertEqual(json.dumps(second[DEFERRED_TOOL]["parameters"], sort_keys=True),
                          json.dumps(late["function"]["parameters"], sort_keys=True))
 
@@ -390,13 +417,65 @@ class AgentLoopTests(unittest.TestCase):
         ]
         self.assertTrue(any(args.get("path") == str(marker) for args in read_arguments), read_arguments)
 
-    def test_unsolicited_native_write_is_refused_without_effect(self):
+    def test_native_write_runs_hermes_write_file_and_replays_native(self):
         marker = self.root / "native-write.txt"
         result = self._run("native_write", marker=str(marker))
-        self.assertFalse(marker.exists(), "an unadvertised native tool executed")
+        self.assertEqual(marker.read_text(), "fixture-native")
+        self.assertIn('"bytes_written"', str(result["final_response"]))
+        self.assertEqual(_assistant_calls(self.fixture), ["write"])
+
+    def test_unsolicited_native_edit_is_refused_without_effect(self):
+        marker = self.root / "native-edit.txt"
+        marker.write_text("x", encoding="utf-8")
+        result = self._run("native_edit", marker=str(marker))
+        self.assertEqual(marker.read_text(), "x", "an unadvertised native tool executed")
         self.assertEqual(self.fixture.request_count, 1)
         self.assertIn("not exposed", str(result["final_response"]))
         self.assertEqual(_assistant_calls(self.fixture), [])
+
+    def test_native_grep_literal_runs_search_files(self):
+        target = self.root / "grep"
+        target.mkdir()
+        (target / "a.txt").write_text("call a.b( here\n", encoding="utf-8")
+        result = self._run("native_grep", marker=str(target))
+        self.assertIn('"total_count": 1', str(result["final_response"]))
+        self.assertEqual(_assistant_calls(self.fixture), ["grep"])
+
+    def test_native_glob_hidden_is_refused_before_dispatch(self):
+        result = self._run("native_glob_hidden", marker=str(self.root))
+        self.assertIn("hidden:true", str(result["final_response"]))
+        self.assertEqual(self.fixture.request_count, 1, "a refusal must not retry inference")
+        self.assertEqual(_assistant_calls(self.fixture), [])
+
+    def test_native_question_runs_clarify_with_folded_header(self):
+        seen = []
+        agent = self._agent("native_question")
+        agent.clarify_callback = lambda qs: (seen.extend(qs) or {
+            "answers": {q["qid"]: q["choices_offered"][0] for q in qs}, "outcome": "submitted"})
+        result = agent.run_conversation(user_message="ask")
+        self.assertEqual(seen[0]["choices_offered"], ["alpha", "beta"])
+        self.assertIn("Choice", seen[0]["question"])
+        self.assertIn("alpha: first", seen[0]["question"])
+        self.assertIn('"outcome": "submitted"', str(result["final_response"]))
+        self.assertEqual(_assistant_calls(self.fixture), ["question"])
+
+    def test_native_todowrite_uses_the_session_hermes_store(self):
+        # todo_list is deferred behind tool_search by default (then todowrite
+        # stays hidden and the bridge reaches todo_list); make it eager here.
+        import yaml
+
+        config_path = self.home / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        config.setdefault("tools", {}).setdefault("tool_search", {})["defer"] = []
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        result = self._run("native_todowrite", toolsets=WANTED + ["todo"])
+        tools = _outgoing_tools(self.fixture, 0)
+        self.assertIn("todowrite", tools)
+        self.assertNotIn("todo_list", tools)
+        self.assertIn('"in_progress": 1', str(result["final_response"]))
+        self.assertEqual(self.agent._todo_store.read(),
+                         [{"id": "1", "content": "plan", "status": "in_progress"}])
+        self.assertEqual(_assistant_calls(self.fixture), ["todowrite"])
 
     def test_native_execute_is_refused_without_effect(self):
         marker = self.root / "execute.txt"
@@ -413,7 +492,9 @@ class AgentLoopTests(unittest.TestCase):
         tools = _outgoing_tools(self.fixture, 0)
         expected = set(self.agent.valid_tool_names)
         self.assertTrue(expected, "the agent exposed no tool names")
-        missing = expected - set(tools)
+        replaced = {"read_file", "write_file", "search_files", "clarify"}
+        self.assertFalse(replaced & set(tools), "replaced Hermes schema duplicated")
+        missing = expected - set(tools) - replaced
         # A Hermes name that collides with a native registry id is advertised
         # under its reversible wire alias, never dropped.
         for name in sorted(missing):
@@ -431,7 +512,7 @@ class AgentLoopTests(unittest.TestCase):
                              f"schema {name} was rewritten")
             self.assertEqual(function["description"], canonical.get("description", ""),
                              f"description {name} was rewritten")
-        for forbidden in ("write", "edit", "shell", "execute", "subagent", "grep", "glob", "task"):
+        for forbidden in ("edit", "shell", "execute", "subagent", "task", "skill", "webfetch"):
             self.assertNotIn(forbidden, tools, f"native {forbidden} was advertised")
         self.assertEqual(_tool_messages(self.fixture), [])
 
