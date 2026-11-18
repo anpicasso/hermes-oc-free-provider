@@ -62,6 +62,21 @@ class Fixture:
                 if fixture.delay:
                     time.sleep(fixture.delay)
                 mode = "text_stop" if fixture.has_tool_results(body) else fixture.modes[min(index, len(fixture.modes) - 1)]
+                if mode.startswith("http_"):
+                    # `http_<status>[_sse]`: a non-200 upstream answer with a JSON error
+                    # body; `_sse` labels it text/event-stream like some gateways do.
+                    status = int(mode.split("_")[1])
+                    error = json.dumps({"type": "error", "error": {
+                        "type": "FreeUsageLimitError" if status == 429 else "upstream_error",
+                        "message": f"fixture HTTP {status}"}}).encode()
+                    self.send_response(status)
+                    self.send_header("content-type", "text/event-stream" if mode.endswith("_sse") else "application/json")
+                    self.send_header("content-length", str(len(error)))
+                    if status == 429:
+                        self.send_header("retry-after", "3600")
+                    self.end_headers()
+                    self.wfile.write(error)
+                    return
                 payload = b"".join(fixture.sse(body, mode))
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")

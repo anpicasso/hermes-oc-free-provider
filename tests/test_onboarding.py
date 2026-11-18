@@ -223,7 +223,7 @@ class RequestControlCase(unittest.TestCase):
 
     def test_iterating_a_completion_is_a_clear_refusal(self) -> None:
         client = OpenCodeClient(runtime=object())
-        lazy = client.chat.completions.create(messages=[])
+        lazy = client.create_lazy(messages=[])
         with self.assertRaises(ControlRefused) as refused:
             iter(lazy)
         self.assertIn("streaming is not advertised", str(refused.exception))

@@ -13,6 +13,7 @@ arguments. Native tools outside the catalog are refused with no side effect.
 """
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
@@ -32,6 +33,10 @@ _SCRATCH = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
 # temp home even when the shell exports an active profile: otherwise discovery
 # loads the installed copy and shadows this checkout.
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="agent-loop-home-", dir=str(_SCRATCH))
+# Per-test roots live under this home, so late background writers (session or
+# log dirs recreated after tearDown) are removed with it at interpreter exit.
+_MODULE_HOME = Path(os.environ["HERMES_HOME"])
+atexit.register(shutil.rmtree, _MODULE_HOME, ignore_errors=True)
 
 from run_agent import AIAgent  # noqa: E402
 from runtime.fixture import Fixture  # noqa: E402
@@ -168,7 +173,7 @@ class AgentLoopTests(unittest.TestCase):
         _plugin()
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="agent-loop-", dir=str(_SCRATCH)))
+        self.root = Path(tempfile.mkdtemp(prefix="agent-loop-", dir=str(_MODULE_HOME)))
         self.home = self.root / "home"
         self.home.mkdir()
         self.companion = self.root / "companion-root" / "tests" / "fixtures" / "agent_loop_companion"
@@ -305,6 +310,63 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("read_file", second)
         self.assertEqual(json.dumps(second[DEFERRED_TOOL]["parameters"], sort_keys=True),
                          json.dumps(late["function"]["parameters"], sort_keys=True))
+
+    def test_interrupt_reaches_an_in_flight_request(self):
+        # Host boundary: Hermes runs the request on a watched worker and polls for
+        # interrupts/stale kills only while that worker is alive. The provider work
+        # must happen inside create(), not later when the main thread reads the result.
+        import threading
+        import time
+
+        agent = self._agent("text_stop")
+        self.fixture.delay = 8.0
+        outcome = {}
+
+        def run():
+            started = time.monotonic()
+            try:
+                outcome["result"] = agent.run_conversation(user_message="slow request")
+            except BaseException as error:  # noqa: BLE001 - recorded for the assertion
+                outcome["error"] = error
+            outcome["elapsed"] = time.monotonic() - started
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 30
+        while self.fixture.request_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.fixture.request_count, 1, "the fixture never received the request")
+        interrupted_at = time.monotonic()
+        agent.interrupt("stop")
+        worker.join(timeout=30)
+        self.assertFalse(worker.is_alive())
+        waited = time.monotonic() - interrupted_at
+        # The fixture holds the response for 8s; a watched request stops in ~1s.
+        self.assertLess(waited, 4.0, f"interrupt waited for the full response: {outcome}")
+        self.assertTrue(outcome["result"]["interrupted"], outcome)
+        self.assertNotIn("fixture text", str(outcome["result"].get("final_response")))
+
+    def test_upstream_429_surfaces_as_a_classified_rate_limit_in_the_agent_loop(self):
+        # Stock AIAgent with no fallback: the structured 429 must reach the host
+        # classifier as `rate_limit` (fallback-eligible), not `unknown`.
+        from unittest import mock
+        from agent import error_classifier, turn_api_error
+
+        seen = []
+        real = error_classifier.classify_api_error
+
+        def spy(error, *args, **kwargs):
+            verdict = real(error, *args, **kwargs)
+            seen.append((getattr(error, "status_code", None), verdict.reason))
+            return verdict
+
+        agent = self._agent("http_429")
+        # Observe the turn's own classifier binding; the verdict is unchanged.
+        with mock.patch.object(turn_api_error, "classify_api_error", spy):
+            result = agent.run_conversation(user_message="quota")
+        self.assertTrue(seen, "the host classifier never saw the provider error")
+        self.assertEqual(seen[0], (429, error_classifier.FailoverReason.rate_limit), seen)
+        self.assertNotIn("fixture text", str(result.get("final_response")))
 
     def test_second_turn_replays_native_read_with_original_arguments(self):
         marker = self.root / "second.txt"

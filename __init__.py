@@ -9,13 +9,21 @@ from pathlib import Path
 from providers import register_provider
 from providers.base import ProviderProfile
 
-_PLUGIN_DIR = str(Path(__file__).parent)
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
-
-import oc_binary
-from oc_catalog import describe_models, free_model_ids
-from oc_translate import NATIVE_CARRIER
+# Hermes imports each profile's copy as its own package; relative imports keep
+# two copies from sharing one bare `sys.modules` entry. A plain file import
+# (no package path, as in some tests) falls back to this directory on sys.path.
+_AS_PACKAGE = bool(__package__) and sys.modules.get(__package__) is not None
+if _AS_PACKAGE:
+    from . import oc_binary
+    from .oc_catalog import describe_models, free_model_ids
+    from .oc_translate import NATIVE_CARRIER
+else:
+    _PLUGIN_DIR = str(Path(__file__).parent)
+    if _PLUGIN_DIR not in sys.path:
+        sys.path.insert(0, _PLUGIN_DIR)
+    import oc_binary
+    from oc_catalog import describe_models, free_model_ids
+    from oc_translate import NATIVE_CARRIER
 
 # Logical identity only: no HTTP request is made to it. Must match
 # hermes_oc_client.LOGICAL_BASE_URL (RUNTIME_API.md), or core's generic catalog
@@ -104,7 +112,10 @@ class OpenCodeFreeProfile(ProviderProfile):
         self.__dict__["_process_command_seed"] = _seed
 
     def create_client(self, **kwargs):
-        from hermes_oc_client import OpenCodeClient
+        if _AS_PACKAGE:
+            from .hermes_oc_client import OpenCodeClient
+        else:
+            from hermes_oc_client import OpenCodeClient
         return OpenCodeClient(**kwargs)
 
     def build_api_kwargs_extras(
@@ -189,6 +200,24 @@ class OpenCodeFreeProfile(ProviderProfile):
 
     def invalidate_catalog_cache(self):
         getattr(self, "_native_catalog_cache", {}).pop(self._catalog_key(), None)
+
+    def get_model_context_length(self, model):
+        """Native catalog `limit.context` for this profile's cached rows, else None.
+
+        Cache-only: this runs on Hermes' context-resolution hot path, so it never
+        starts OpenCode. Staleness past the picker TTL is fine for a window size.
+        ponytail: a cold cache (no discovery yet in this process) defers to
+        Hermes' fallback; add a persisted cache if that proves too common.
+        """
+        try:
+            entry = getattr(self, "_native_catalog_cache", {}).get(self._catalog_key())
+            for row in (entry[1] if entry else None) or ():
+                if row.get("providerID") == "opencode" and model in (row.get("id"), row.get("qualified_id")):
+                    context = (row.get("limit") or {}).get("context")
+                    return context if type(context) is int and context > 0 else None
+        except Exception:  # noqa: BLE001 - a metadata hook must never break a turn
+            return None
+        return None
 
     def resolve_aux_model(self, *, vision=False):
         # Auxiliary calls send temperature/max_tokens, which this transport

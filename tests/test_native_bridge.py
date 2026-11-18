@@ -325,6 +325,61 @@ class CompletionTests(RuntimeCase):
         self.assertIn("valid prompt/completion token usage", str(refused.exception))
         self.assertEqual(fixture.request_count, 1)
 
+    def test_upstream_http_status_reaches_the_host_classifier(self) -> None:
+        # The official binary reports the upstream status as structured data
+        # (`step_failed.error.status`, companion `completion.status`). It must
+        # reach `.status_code`, and only a real 429 classifies as a rate limit.
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        expected = {
+            "http_429": (429, FailoverReason.rate_limit),
+            "http_429_sse": (429, FailoverReason.rate_limit),
+            "http_503": (503, None),
+            "http_503_sse": (503, None),
+            "http_401": (401, None),
+        }
+        for mode, (status, reason) in expected.items():
+            with self.subTest(mode=mode):
+                fixture = self.fixture([mode])
+                client = self.client(self.runtime(fixture))
+                with self.assertRaises(CompletionRefused) as refused:
+                    client.complete(messages=[{"role": "user", "content": "hi"}], tools=[helpers.READ_FILE_TOOL])
+                self.assertEqual(refused.exception.status_code, status, str(refused.exception))
+                self.assertEqual(fixture.request_count, 1)
+                verdict = classify_api_error(refused.exception, provider="opencode-free", model="nonce")
+                if reason is not None:
+                    self.assertEqual(verdict.reason, reason)
+                else:
+                    self.assertNotEqual(verdict.reason, FailoverReason.rate_limit)
+
+    def test_refusals_without_an_upstream_status_carry_none(self) -> None:
+        # A 200 stream that fails mid-way, or a local validation refusal, has no
+        # HTTP status; never invent one (and never 429) from the message text.
+        for mode in ("tool_call_error", "text_no_usage", "text_unsupported_finish"):
+            with self.subTest(mode=mode):
+                fixture = self.fixture([mode])
+                client = self.client(self.runtime(fixture))
+                with self.assertRaises(CompletionRefused) as refused:
+                    client.complete(messages=[{"role": "user", "content": "hi"}], tools=[helpers.READ_FILE_TOOL])
+                self.assertIsNone(refused.exception.status_code, str(refused.exception))
+        text_only = CompletionRefused("native response refused: response completion rejected: HTTP 429")
+        self.assertIsNone(text_only.status_code)
+        # Every event shape the runtime reads; bools and non-error codes never count.
+        from oc_runtime import _upstream_status
+        self.assertEqual(_upstream_status({"type": "completion", "status": 429}), 429)
+        self.assertEqual(_upstream_status({"type": "step_failed", "error": {"status": 502}}), 502)
+        self.assertEqual(_upstream_status({"type": "response_unverified", "outcome": {"status": 429}}), 429)
+        for event in ({"status": 200}, {"status": True}, {"status": "429"}, {"error": "HTTP 429"},
+                      {"status": 700}, None, {}):
+            self.assertIsNone(_upstream_status(event), event)
+        # Both _validate_completion refusal branches keep a structured status.
+        from oc_runtime import Session
+        for completion in ({"ok": False, "done": False, "status": 429, "error": "HTTP 429"},
+                           {"ok": True, "done": True, "status": 503, "error": "late upstream error"}):
+            with self.assertRaises(CompletionRefused) as caught:
+                Session._validate_completion(completion, 1, expected_calls=0, allow_length=True)
+            self.assertEqual(caught.exception.status_code, completion["status"])
+
     def test_zero_usage_is_valid_not_missing(self) -> None:
         fixture = self.fixture(["text_zero_usage"])
         client = self.client(self.runtime(fixture))
@@ -556,6 +611,30 @@ class ClientPolicyTests(RuntimeCase):
         self.assertEqual(result, "done")
         self.assertEqual(lazy, "done")
         self.assertGreaterEqual(ticks, 5)
+
+    def test_sync_create_does_the_work_inside_create(self) -> None:
+        # Hermes' watchdog only sees work done inside create(); see
+        # test_actual_agent_loop.test_interrupt_reaches_an_in_flight_request.
+        client = OpenCodeClient(runtime=object(), model="nonce")
+        self._clients.append(client)
+        calls = []
+
+        def slow(**_kwargs):
+            time.sleep(0.3)
+            calls.append(1)
+            return "done"
+
+        client.complete = slow  # type: ignore[method-assign]
+        started = time.monotonic()
+        handle = client.chat.completions.create(messages=[{"role": "user", "content": "hi"}])
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        self.assertEqual(calls, [1])
+        self.assertEqual(asyncio.run(_await(handle)), "done")
+        self.assertEqual(calls, [1], "awaiting a resolved completion re-ran the request")
+
+
+async def _await(value):
+    return await value
 
 
 if __name__ == "__main__":

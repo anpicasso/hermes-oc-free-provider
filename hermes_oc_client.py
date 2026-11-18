@@ -19,19 +19,32 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-import oc_affinity
-import oc_catalog
-import oc_translate
-from oc_runtime import (
-    ControlRefused,
-    NativeRuntime,
-    OpenCodeRuntimeError,
-    RuntimeClosed,
-    SUPPORTED_PACKAGE,
-    SnapshotRefused,
-    StepResult,
-    ToolCall,
-)
+if __package__:  # one profile copy's package; see __init__.py
+    from . import oc_affinity, oc_catalog, oc_translate
+    from .oc_runtime import (
+        ControlRefused,
+        NativeRuntime,
+        OpenCodeRuntimeError,
+        RuntimeClosed,
+        SUPPORTED_PACKAGE,
+        SnapshotRefused,
+        StepResult,
+        ToolCall,
+    )
+else:
+    import oc_affinity
+    import oc_catalog
+    import oc_translate
+    from oc_runtime import (
+        ControlRefused,
+        NativeRuntime,
+        OpenCodeRuntimeError,
+        RuntimeClosed,
+        SUPPORTED_PACKAGE,
+        SnapshotRefused,
+        StepResult,
+        ToolCall,
+    )
 
 LOGICAL_BASE_URL = "opencode-native://local"
 LOGGER = logging.getLogger(__name__)
@@ -1073,7 +1086,16 @@ class OpenCodeClient:
             if key in kwargs
         }
         self._validate_request(**controls)
-        return self.create_lazy(**kwargs)
+        lazy = self.create_lazy(**kwargs)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous caller: do the work here, like an OpenAI client. Hermes
+            # runs create() on a watched worker; deferring to attribute access
+            # moved the blocking call outside its interrupt/stale watchdog.
+            lazy._resolve()
+        # On an event loop the caller awaits it: resolved off-loop in a thread.
+        return lazy
 
     def stream(self, **_kwargs: Any):
         raise ControlRefused("native streaming is not advertised")

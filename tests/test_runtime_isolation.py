@@ -69,6 +69,22 @@ class RuntimeIsolationTests(unittest.TestCase):
             self.assertTrue(hostile.exists())
             self.assertEqual((parent / "opencode.json").read_bytes(), original)
 
+    def test_runtime_env_keeps_the_probe_platform_allowlist(self):
+        # Windows loaders need SYSTEMROOT/WINDIR/COMSPEC/PATHEXT/SYSTEMDRIVE; the
+        # runtime must keep exactly what the version probe keeps, and no secret.
+        import oc_binary
+
+        with tempfile.TemporaryDirectory(prefix="oc-env-") as directory:
+            runtime = NativeRuntime(binary=BINARY, companion=PRODUCTION_COMPANION, root=directory)
+            runtime.root, runtime.home = Path(directory), Path(directory) / "home"
+            platform = {key: f"value-{key}" for key in oc_binary._PLATFORM_ENV}
+            with patch.dict(os.environ, {**platform, "OPENCODE_API_KEY": "secret-not-forwarded"}):
+                env = runtime._child_env()
+            for key, value in platform.items():
+                self.assertEqual(env.get(key), value, key)
+            self.assertNotIn("OPENCODE_API_KEY", env)
+            self.assertEqual(env["HOME"], str(runtime.home))
+
 
 if __name__ == "__main__":
     unittest.main()

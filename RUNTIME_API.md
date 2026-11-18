@@ -382,6 +382,10 @@ cheap (no subprocess). Runtime resolution additionally accepts core's resolved
 command as a validated fallback hint, after PATH and config.
 
 `create_lazy()` returns a value that resolves on attribute access or `await`.
+`chat.completions.create()` from synchronous code runs the request before it
+returns, like an OpenAI client, so Hermes' worker watchdog (interrupt and stale
+kill) covers it. Called from a running event loop it returns immediately and
+the request runs in a worker thread when awaited.
 `stream()` raises `ControlRefused("native streaming is not advertised")`.
 `close()`/`aclose()` release the owner or stop an owned runtime; idempotent.
 
@@ -394,6 +398,9 @@ All public errors inherit `OpenCodeRuntimeError` and expose `.code`:
 `runtime.transport`, `runtime.closed`. A timeout, truncation, malformed event,
 unverified completion or dead process is never returned as a successful
 completion. A local contract failure does not fabricate an upstream HTTP status.
+Every error also exposes `.status_code`: the upstream 4xx/5xx the official
+runtime reported (`completion.status`, `step_failed.error.status`, or a
+`response_unverified` outcome), else `None`.
 
 ## Test-only fixture boundary
 

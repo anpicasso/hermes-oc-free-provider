@@ -2,6 +2,31 @@
 
 Notable changes to `oc-free-provider`.
 
+## Unreleased
+
+- **Upstream HTTP status reaches Hermes.** `CompletionRefused.status_code` now
+  carries the 4xx/5xx the official runtime reports (companion `completion`
+  outcome, OpenCode `step_failed.error.status`, `response_unverified` outcome),
+  so a 429 free-usage limit is classified as a rate limit and 5xx as a server
+  error. Refusals without a reported status carry `None`; nothing is inferred
+  from message text. Adapted from douglasanpa `8a4fc07`.
+- **Synchronous create runs inside the call.** `chat.completions.create()`
+  performs the request before returning when no event loop is running, so
+  Hermes' interrupt and stale-call watchdog covers it. Previously the request
+  ran on first attribute access, after the watched worker had returned, and an
+  interrupt waited for the whole response. Awaiting from an event loop is
+  unchanged (off-loop thread). Adapted from pasei `9841760`.
+- **Profile copies stay isolated.** Package-relative sibling imports when Hermes
+  loads a profile's copy, so two profiles in one process no longer share bare
+  `oc_*`/`hermes_oc_client` modules. Adapted from pasei `a05dd17`.
+- **Catalog context window.** `get_model_context_length` returns the native
+  catalog `limit.context` from this profile's cached discovery rows, without
+  starting OpenCode; a cold cache defers to Hermes' fallback. Adapted from pasei
+  `e31b61d` (context only; `max_tokens` remains unsupported).
+- **Runtime environment.** The runtime child keeps the same platform allowlist
+  as the version probe, including Windows loader variables. Native Windows
+  remains unverified. Related to douglasanpa `e9cfe32`.
+
 ## 4.2.1 — 2026-11-16
 
 - **Companion isolation hardening.** Each runtime admits only one live session.

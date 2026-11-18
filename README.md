@@ -211,7 +211,10 @@ framing produce a clear provider error naming the model and the failed
 contract, with **zero** tool executions and no weaker retry. Optional cache /
 reasoning-token breakdowns and opaque native metadata are preserved when
 supplied and never invented. A failed response is not evidence to remove a
-model from discovery; real upstream HTTP status is preserved when one exists.
+model from discovery. When the official runtime reports an upstream HTTP error
+status (for example a 429 free-usage limit), the raised `CompletionRefused`
+carries it as `.status_code` for Hermes' retry/fallback classifier; a refusal
+with no reported status carries `None`, never a status guessed from text.
 
 ## Limitations
 
@@ -273,11 +276,13 @@ process `PATH`; the provider itself never reads that variable.
 ```bash
 export TMPDIR=/path/to/scratch
 export HERMES_OPENCODE_BINARY=/path/to/opencode
-# Set an isolated home BEFORE Python starts; use the core venv interpreter and
-# put the core checkout on PYTHONPATH so imports never depend on discovery order.
+# Set an isolated home BEFORE Python starts; use the interpreter that matches
+# the dependency environment Hermes activates at import (`hermes_bootstrap`);
+# a different minor version loads incompatible compiled wheels, and features
+# behind them (for example the deferred-tool `tool_call` bridge) silently drop.
 export HERMES_HOME="$(mktemp -d "$TMPDIR/oc-test-home.XXXXXX")"
 export PYTHONPATH=/path/to/hermes-core-checkout
-/path/to/hermes-core/venv/bin/python -m unittest discover -s tests -t . -v
+/path/to/hermes-runtime-python -m unittest discover -s tests -t . -v
 ```
 
 Translation-only tests need no binary:

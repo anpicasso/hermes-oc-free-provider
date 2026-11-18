@@ -29,8 +29,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from oc_binary import MIN_VERSION, BinaryUnavailable, probe_version, resolve as resolve_binary
-from oc_watchdog import ConversationFailed, Watchdog, WatchdogRefused
+if __package__:  # one profile copy's package; see __init__.py
+    from .oc_binary import MIN_VERSION, BinaryUnavailable, _probe_env, probe_version, resolve as resolve_binary
+    from .oc_watchdog import ConversationFailed, Watchdog, WatchdogRefused
+else:
+    from oc_binary import MIN_VERSION, BinaryUnavailable, _probe_env, probe_version, resolve as resolve_binary
+    from oc_watchdog import ConversationFailed, Watchdog, WatchdogRefused
 
 # Minimum official version; the handshake verifies the loaded companion and
 # binary at runtime. A newer release is accepted but never assumed compatible.
@@ -72,10 +76,30 @@ class OpenCodeRuntimeError(RuntimeError):
 
     code = "runtime.error"
 
-    def __init__(self, message: str, *, code: str | None = None, details: dict | None = None):
+    def __init__(self, message: str, *, code: str | None = None, details: dict | None = None,
+                 status_code: int | None = None):
         super().__init__(message)
         self.code = code or type(self).code
         self.details = details or {}
+        # Upstream HTTP status reported by the official runtime, never inferred
+        # from text. Hermes' error classifier reads `.status_code` first.
+        self.status_code = status_code
+
+
+def _upstream_status(event: Any) -> int | None:
+    """HTTP error status the official runtime/companion attached to an event.
+
+    `completion.status` (companion outcome), `step_failed.error.status`
+    (OpenCode `Session.StructuredError`) and `response_unverified.outcome.status`.
+    Only 4xx/5xx count: a 200 stream that failed mid-way has no error status.
+    """
+    if not isinstance(event, dict):
+        return None
+    for holder in (event, event.get("error"), event.get("outcome")):
+        status = holder.get("status") if isinstance(holder, dict) else None
+        if type(status) is int and 400 <= status <= 599:
+            return status
+    return None
 
 
 class BinaryRefused(OpenCodeRuntimeError):
@@ -564,10 +588,8 @@ class NativeRuntime:
         self._prepared = True
 
     def _child_env(self) -> dict[str, str]:
-        env: dict[str, str] = {}
-        for key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SSL_CERT_FILE", "SSL_CERT_DIR"):
-            if key in os.environ:
-                env[key] = os.environ[key]
+        # Same allowlist as the version probe: Windows needs its loader vars to start.
+        env = _probe_env()
         assert self.root is not None and self.home is not None
         env.update(
             HOME=str(self.home),
@@ -1326,7 +1348,7 @@ class Session:
         refusal = self._refusal(boundary_events, generation)
         if refusal is not None:
             reason = refusal.get("reason") or refusal.get("message") or refusal.get("error") or refusal
-            raise CompletionRefused(f"native response refused: {reason}")
+            raise CompletionRefused(f"native response refused: {reason}", status_code=_upstream_status(refusal))
         streamed = next(
             (
                 event
@@ -1338,11 +1360,12 @@ class Session:
         if streamed is None:
             raise CompletionRefused("native step did not reach a primary streamed boundary")
         if streamed.get("completionValidated") is not True:
-            reason = next(
-                (event.get("reason") for event in boundary_events if event.get("type") == "response_unverified"),
-                "response completion was not validated",
+            unverified = next(
+                (event for event in boundary_events if event.get("type") == "response_unverified"), {}
             )
-            raise CompletionRefused(f"native response completion rejected: {reason}")
+            reason = unverified.get("reason") or "response completion was not validated"
+            raise CompletionRefused(f"native response completion rejected: {reason}",
+                                    status_code=_upstream_status(unverified))
         assistant_id = str(streamed.get("assistantMessageID") or "")
         calls = self._validate_calls(streamed.get("calls") or [])
         completion = self._completion(boundary_events)
@@ -1377,7 +1400,8 @@ class Session:
             None,
         )
         if failed is not None:
-            raise CompletionRefused(f"native step failed: {failed.get('error') or failed}")
+            raise CompletionRefused(f"native step failed: {failed.get('error') or failed}",
+                                    status_code=_upstream_status(failed))
         ended = next(
             (
                 event
@@ -1430,11 +1454,14 @@ class Session:
     def _validate_completion(completion: dict, generation: int, *, expected_calls: int, allow_length: bool) -> None:
         if completion.get("ok") is not True or completion.get("done") is not True:
             reason = completion.get("error") or "completion was not positively validated"
-            raise CompletionRefused(f"native response completion rejected: {reason}")
+            raise CompletionRefused(f"native response completion rejected: {reason}",
+                                    status_code=_upstream_status(completion))
         if completion.get("generation") not in {None, generation}:
             raise CompletionRefused("native completion belongs to a different generation")
         if completion.get("error"):
-            raise CompletionRefused(f"native response error: {completion['error']}")
+            # ponytail: the companion never sends ok=true with an error; kept consistent anyway.
+            raise CompletionRefused(f"native response error: {completion['error']}",
+                                    status_code=_upstream_status(completion))
         finish = completion.get("finish")
         if finish is None:
             raise CompletionRefused("native response has no terminal finish reason")

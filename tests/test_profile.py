@@ -87,6 +87,29 @@ with patch.object(p, "create_client", return_value=c):
     assert p.resolve_aux_model(vision=True) == ""
 assert c.closed >= 4
 p.invalidate_catalog_cache()
+# Context window: the real host resolver reads this profile's cached native row
+# and never starts OpenCode to answer. Cold cache defers to Hermes' fallback.
+from agent.model_metadata import get_model_context_length
+ctx_row = dict(row, id="ctx-free-model", limit={"context": 123_456, "output": 4_096})
+cold = get_model_context_length("ctx-free-model", base_url=p.base_url, provider="opencode-free")
+assert cold != 123_456, cold
+with patch.object(p, "create_client", side_effect=AssertionError("context hook started OpenCode")):
+    assert get_model_context_length("ctx-free-model", base_url=p.base_url, provider="opencode-free") == cold
+c.rows = [ctx_row]
+with patch.object(p, "create_client", return_value=c):
+    assert p.fetch_models() == ["ctx-free-model"]
+with patch.object(p, "create_client", side_effect=AssertionError("context hook started OpenCode")):
+    assert get_model_context_length("ctx-free-model", base_url=p.base_url, provider="opencode-free") == 123_456
+    assert get_model_context_length("opencode/ctx-free-model", base_url=p.base_url, provider="opencode-free") == 123_456
+    assert p.get_model_context_length("absent-model") is None
+    token = set_hermes_home_override(os.environ["SECOND_HOME"])
+    try:  # another profile's cached rows never answer for this one
+        assert p.get_model_context_length("ctx-free-model") is None
+    finally:
+        reset_hermes_home_override(token)
+p._native_catalog_cache = {p._catalog_key(): (time.monotonic(), [dict(ctx_row, limit={"context": "big"})])}
+assert p.get_model_context_length("ctx-free-model") is None
+p.invalidate_catalog_cache()
 # Actual auxiliary seam: the shared router returns this provider's client, and
 # a normal auxiliary control request is refused loudly at create time instead
 # of being silently dropped. No runtime is started because validation precedes
