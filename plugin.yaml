@@ -1,7 +1,7 @@
 manifest_version: 1
 name: oc-free-provider
 kind: model-provider
-version: 4.2.1
+version: 4.3.0
 requires_hermes: ">=0.23.1"
 description: Official OpenCode runtime plus companion with Hermes-controlled tool effects
 homepage: https://github.com/anpicasso/hermes-oc-free-provider
