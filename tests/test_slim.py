@@ -120,6 +120,34 @@ def test_wire_rename_flagged_names():
     assert plan.wire_to_host["bash"] == "terminal"
 
 
+def test_bash_translator_roundtrip():
+    # The 7th translation: wire `bash` -> Hermes terminal, both directions.
+    hermes = [{"type": "function", "function": {"name": "terminal", "description": "Run a command.",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"},
+                               "timeout": {"type": "integer"}, "workdir": {"type": "string"}},
+                               "required": ["command"]}}},
+              {"type": "function", "function": {"name": "read_file", "description": "Read a file.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                               "required": ["path"]}}}]
+    plan = t.plan_tools(hermes, ["read"])
+    assert plan.wire_to_host["bash"] == "terminal"
+    # inbound: model calls bash; args flow through in Hermes units + defaults
+    host, args = t.translate_call("bash", {"command": "echo hi", "timeout": 5000}, plan=plan)
+    assert host == "terminal" and args == {"command": "echo hi", "timeout": 5000}, (host, args)
+    # inbound under the Hermes name still dispatches (history tolerance)
+    host, args = t.translate_call("terminal", {"command": "echo hi"}, plan=plan)
+    assert host == "terminal" and args["timeout"] == 120, (host, args)
+    # outbound: Hermes history replays under the wire name
+    messages = [{"role": "user", "content": "run ls"},
+                {"role": "assistant", "content": None,
+                 "tool_calls": [{"id": "call_1", "type": "function",
+                                 "function": {"name": "terminal", "arguments": '{"command": "ls"}'}}]}]
+    snap = t.snapshot_from_openai(messages, plan=plan)
+    names = [p.get("name") for m in snap.messages for p in (m.get("content") or [])
+             if isinstance(p, dict) and p.get("type") == "tool-call"]
+    assert names == ["bash"], names
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

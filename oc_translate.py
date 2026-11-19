@@ -257,114 +257,33 @@ NATIVE_MAP: dict[str, tuple[str, Any]] = {
 }
 
 
-# --- experiment subset harness ------------------------------------------------
-# ponytail: env-gated extra mappings for the main-branch tool experiment.
-# OC_EXTRA_TOOLS lists capability groups; default (unset) == untouched main.
-# Groups accept both OC name spellings observed across versions/models:
-#   shell -> bash,shell  edit -> edit  skill -> skill  task -> task,subagent
-#   webfetch -> webfetch  websearch -> websearch
-# Each extra mapper is lenient about both argument spellings (path/filePath)
-# because the experiment must measure capability need, not schema pedantry.
-def _opt_string(arguments: dict, *keys: str, required: bool = True) -> str | None:
-    for key in keys:
-        if key in arguments:
-            return _string(arguments, key)
-    if required:
-        raise NativeInvalidArguments(f"native tool requires one of {', '.join(keys)}")
-    return None
+# The `bash` wire name rides WIRE_RENAMES below. The wire advertises Hermes
+# terminal's own schema under the OC name, so arguments arrive in Hermes
+# units; the mapper only adds sane defaults and refuses the no-deadline
+# foreground form Hermes terminal cannot represent.
+_BASH_ALLOWED = {"command", "workdir", "timeout", "background", "description",
+                 "pty", "notify", "heartbeat", "persist_on_release"}
 
 
-def _map_shell_extra(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
-    _strict(arguments, {"command", "workdir", "timeout", "background", "description"}, "shell")
+def _map_bash(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
+    _strict(arguments, _BASH_ALLOWED, "bash")
     mapped: dict[str, Any] = {"command": _string(arguments, "command")}
-    if arguments.get("workdir") is not None:
-        mapped["workdir"] = _string(arguments, "workdir")
+    for key in ("workdir", "timeout", "pty", "notify", "heartbeat", "persist_on_release"):
+        if key in arguments:
+            mapped[key] = arguments[key]
     if _boolean(arguments, "background") is True:
         mapped["background"] = True
-    if arguments.get("timeout") is not None:
-        milliseconds = _integer(arguments["timeout"], "shell timeout", minimum=0)
-        if milliseconds == 0 and not mapped.get("background"):
-            raise NativeUnsupported("native shell timeout=0 (no deadline) has no Hermes foreground equivalent")
-        mapped["timeout"] = max(1, math.ceil(milliseconds / 1000)) if milliseconds else 600
-    elif not mapped.get("background"):
+    if mapped.get("timeout") is None and not mapped.get("background"):
         mapped["timeout"] = 120
+    elif mapped.get("timeout") == 0 and not mapped.get("background"):
+        raise NativeUnsupported("bash timeout=0 (no deadline) has no Hermes foreground equivalent")
     return mapped
 
 
-def _map_edit_extra(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
-    _strict(arguments, {"path", "filePath", "oldString", "newString", "replaceAll"}, "edit")
-    old = _string(arguments, "oldString")
-    new = _string(arguments, "newString", allow_empty=True)
-    if old == new:
-        raise NativeInvalidArguments("edit oldString and newString must differ")
-    mapped: dict[str, Any] = {
-        "path": _opt_string(arguments, "path", "filePath"),
-        "old_string": old,
-        "new_string": new,
-    }
-    if _boolean(arguments, "replaceAll") is True:
-        mapped["replace_all"] = True
-    return mapped
-
-
-def _map_skill_extra(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
-    _strict(arguments, {"id", "name"}, "skill")
-    return {"name": _opt_string(arguments, "id", "name")}
-
-
-def _map_webfetch_extra(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
-    _strict(arguments, {"url", "format", "timeout"}, "webfetch")
-    url = _string(arguments, "url") or ""
-    if not url.startswith(("http://", "https://")):
-        raise NativeUnsupported("webfetch url must use http:// or https://")
-    fmt = arguments.get("format", "markdown")
-    if fmt not in {"text", "markdown", "html"}:
-        raise NativeInvalidArguments("webfetch format must be text, markdown, or html")
-    if fmt != "markdown":
-        raise NativeUnsupported(f"webfetch format={fmt} has no Hermes web_extract equivalent")
-    if arguments.get("timeout") is not None:
-        raise NativeUnsupported("webfetch timeout has no per-call Hermes web_extract equivalent")
-    return {"urls": [url.split("#", 1)[0]]}
-
-def _map_websearch_extra(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
-    _strict(arguments, {"query", "numResults"}, "websearch")
-    mapped: dict[str, Any] = {"query": _string(arguments, "query")}
-    if arguments.get("numResults") is not None:
-        mapped["limit"] = max(1, min(100, _integer(arguments["numResults"], "websearch numResults", minimum=1)))
-    return mapped
-
-
-def _map_task_extra(arguments: dict, forbidden: Iterable[str] = ()) -> dict:
-    _strict(arguments, {"description", "prompt", "subagent_type", "task_id", "command", "background"}, "task")
-    context = [
-        _string(arguments, "description"),
-        "Requested subagent type: " + str(_string(arguments, "subagent_type", required=False) or "general"),
-    ]
-    for key, label in (("task_id", "Previous task ID"), ("command", "Requested command"), ("background", "Requested background execution")):
-        if key in arguments:
-            context.append(f"{label}: {arguments[key]}")
-    return {"tasks": [{"goal": _string(arguments, "prompt"), "context": "\n".join(context)}]}
-
-
-_EXPERIMENT_GROUPS: dict[str, dict[str, tuple[str, Any]]] = {
-    "shell": {
-        "bash": ("terminal", _map_shell_extra),
-        "shell": ("terminal", _map_shell_extra),
-    },
-    "edit": {"edit": ("patch", _map_edit_extra)},
-    "skill": {"skill": ("skill_view", _map_skill_extra)},
-    "task": {
-        "task": ("delegate_task", _map_task_extra),
-        "subagent": ("delegate_task", _map_task_extra),
-    },
-    "webfetch": {"webfetch": ("web_extract", _map_webfetch_extra)},
-    "websearch": {"websearch": ("web_search", _map_websearch_extra)},
-}
-_ACTIVE_GROUPS = frozenset(filter(None, os.environ.get("OC_EXTRA_TOOLS", "").split(",")))
-if _ACTIVE_GROUPS - set(_EXPERIMENT_GROUPS):
-    raise ValueError(f"unknown OC_EXTRA_TOOLS groups: {sorted(_ACTIVE_GROUPS - set(_EXPERIMENT_GROUPS))}")
-for _group in sorted(_ACTIVE_GROUPS):
-    NATIVE_MAP.update(_EXPERIMENT_GROUPS[_group])
+# Argument mappers keyed by wire name, for renamed tools (WIRE_RENAMES) and
+# other wire names whose OpenCode-trained argument habits differ from the
+# Hermes schema. They run Hermes-side only: the request never carries them.
+WIRE_MAPPERS: dict[str, Any] = {"bash": _map_bash}
 # --- end experiment harness ---------------------------------------------------
 
 
@@ -394,14 +313,21 @@ def translate_call(
     enabled = set(enabled) if enabled is not None else (plan.enabled if plan is not None else None)
 
     # An additive Hermes schema the model called directly keeps its identity
-    # and arguments byte-for-byte.
+    # and arguments byte-for-byte, after the wire-name argument mapper.
     if plan is not None and native_name in plan.wire_to_host:
-        return plan.wire_to_host[native_name], arguments
+        host_name = plan.wire_to_host[native_name]
+        mapper = WIRE_MAPPERS.get(native_name)
+        if mapper is not None:
+            arguments = mapper(arguments, forbidden_roots)
+        return host_name, arguments
     # A renamed wire tool the model called under its Hermes name (or its old
     # name from history) still dispatches to the real Hermes tool.
     if plan is not None:
         renamed = WIRE_RENAMES.get(native_name)
         if renamed is not None and renamed in plan.wire_to_host:
+            mapper = WIRE_MAPPERS.get(renamed)
+            if mapper is not None:
+                arguments = mapper(arguments, forbidden_roots)
             return plan.wire_to_host[renamed], arguments
     # A withheld Hermes name (for example from older history) is still an
     # enabled Hermes tool; it dispatches under its own identity.
