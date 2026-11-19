@@ -8,7 +8,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import os
 import oc_translate as T  # noqa: E402
+
+# Byte-for-byte registration contract tests run with slimming off;
+# tests/test_slim.py covers the compact wire form.
+os.environ.setdefault("OC_FREE_SLIM_SCHEMAS", "0")
 
 READ_FILE = {
     "type": "function",
@@ -43,7 +48,7 @@ class PlanTests(unittest.TestCase):
     def test_every_unreplaced_hermes_schema_is_additive_and_exact(self):
         plan = T.plan_tools([READ_FILE, TERMINAL], ["read"])
         # read_file is replaced by native read: one name per capability.
-        self.assertEqual(plan.host_to_wire, {"terminal": "terminal"})
+        self.assertEqual(plan.host_to_wire, {"terminal": "bash"})
         self.assertEqual(plan.native, {"read"})
         self.assertEqual(plan.enabled, {"read_file", "terminal"})
         for row, source in zip(plan.register, (TERMINAL,)):
@@ -181,10 +186,10 @@ class ProvenanceTests(unittest.TestCase):
         ]
         snapshot = T.snapshot_from_openai(messages, plan=plan)
         calls = [item for item in snapshot.messages[1]["content"] if item.get("type") == "tool-call"]
-        self.assertEqual([call["name"] for call in calls], ["read", "terminal"])
+        self.assertEqual([call["name"] for call in calls], ["read", "bash"])
         self.assertEqual(calls[0]["input"], {"path": "a"})
         self.assertEqual(snapshot.messages[2]["content"][0]["name"], "read")
-        self.assertEqual(snapshot.messages[3]["content"][0]["name"], "terminal")
+        self.assertEqual(snapshot.messages[3]["content"][0]["name"], "bash")
 
     def test_orphan_and_duplicate_history_refuse(self):
         with self.assertRaises(T.SnapshotError):

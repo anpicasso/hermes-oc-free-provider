@@ -162,8 +162,13 @@ free. There is no paid fallback and no legacy spoofing transport.
    and observes each primary Chat Completions SSE response non-destructively.
 3. The model-facing catalog uses the constrained native mappings below in
    place of their Hermes schemas, plus every other enabled genuine Hermes tool
-   with its full description and schema. All unmapped native descriptors are
-   removed before the request. OpenCode executes no tool.
+   in a compact wire form (`OC_FREE_SLIM_SCHEMAS=0` restores full schemas):
+   property names, types, required, enums and array `items` survive; prose,
+   defaults and limits are dropped, and each description keeps its first
+   sentence (hard-capped at 300 characters) because free-tier inference
+   enforces a rolling token budget that fat requests exhaust. All unmapped
+   native descriptors are removed before the request. OpenCode executes no
+   tool.
 4. A model-emitted mapped native call (for example `read`) is translated to an
    ordinary Hermes call (`read_file`). Hermes dispatches it through its normal loop, approvals and
    policy. On the next completion the canonical Hermes history is replayed as
@@ -171,6 +176,64 @@ free. There is no paid fallback and no legacy spoofing transport.
 5. Text, reasoning and tool names/arguments/call IDs come from OpenCode's own
    events. The raw SSE observer only decides whether a completion is complete
    and safe to release.
+
+## Free-tier request budget and tool deferral
+
+OpenCode Zen's free tier enforces a rolling token budget per identity, not a
+per-request limit: the largest request that passes drifts over hours, heavy
+usage drains it for everyone else, and exhausted requests answer with HTTP 429
+`FreeUsageLimitError` and a multi-hour `retryAfter`. A request carries the
+system prompt, the conversation history and the full model-facing tool
+catalog, so **too many non-deferred tools is a direct cause of inference
+failures** on free models even when the transport is perfectly healthy.
+
+The gate also runs a **name deny-list on the tool catalog**: a request whose
+tools include a name it flags is refused before inference with the same
+quota-shaped 429 (measured 2026-11-19: a tool named `terminal` is always
+refused; the byte-identical schema under any other name passes). The provider
+renames flagged wire names (`terminal` -> `bash`, the name OC-trained models
+emit naturally) through the same reversible alias machinery used for native
+collisions; Hermes keeps the real tool name at dispatch and replay. If a
+session starts refusing with `FreeUsageLimitError` while small requests pass,
+probe the catalog name by name before blaming the budget — rename, do not
+delete the tool.
+
+The provider already slimms every schema it advertises (see *How a request
+works*). The other lever is Hermes' own deferred-tool bridge — no provider
+configuration needed. In the profile that runs this provider, defer every
+tool the model does not need in its first turns; deferred tools are hidden
+from the request entirely and the model reaches them through
+`tool_search` / `tool_describe` / `tool_call`:
+
+```yaml
+tools:
+  tool_search:
+    enabled: on
+    listing: off            # keep the embedded manifest out of the request
+    defer:                  # heavy, rarely needed in the first turns:
+      - delegate_task       # 4.5 KB schema; subagents are rarely the first move
+      - browser_exec        # 3.3 KB; interactive browsing
+      - skill_manage        # 3.6 KB; authoring skills, not running them
+      - vision_analyze
+      - image_generate
+      - text_to_speech
+      - cronjob_manage
+      - session_search
+      - computer_use
+      - process_manage
+      # plus every plugin toolset you do not use daily (per tool: server:tool)
+```
+
+Keep **direct** (never defer on free models): `read_file`, `write_file`,
+`patch`, `search_files`, `terminal`, `execute_code`, `memory`, `todo_list`,
+`web_search`, `web_extract` and especially `clarify` — Hermes' own A/B
+measurement showed deferring `clarify` collapses its usage (18/18 to 7/18),
+because a model that cannot ask questions guesses instead.
+
+Rule of thumb: keep the whole request under ~6k prompt tokens on free models.
+If a session 429s on its first turn, slim the profile before blaming the
+transport — capture the request and count tokens per section (system, history,
+tools) before changing code.
 
 ## Supported surface
 

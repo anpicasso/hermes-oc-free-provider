@@ -21,6 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import oc_translate as T  # noqa: E402
 
+# Byte-for-byte registration contract tests run with slimming off;
+# tests/test_slim.py covers the compact wire form.
+os.environ.setdefault("OC_FREE_SLIM_SCHEMAS", "0")
+
 
 def _tool(name: str) -> dict:
     return {"type": "function", "function": {
@@ -45,7 +49,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(plan.host_to_wire["patch"], "hermes_patch")
         for kept in ("terminal", "process_manage", "delegate_task", "web_search", "web_extract",
                      "skill_view", "execute_code"):
-            self.assertEqual(plan.host_to_wire[kept], kept)
+            self.assertEqual(plan.host_to_wire[kept], T.WIRE_RENAMES.get(kept, kept))
 
     def test_native_kept_only_while_target_enabled(self):
         plan = T.plan_tools([_tool("read_file"), _tool("terminal")], ALL_NATIVE)
@@ -71,7 +75,7 @@ class CatalogTests(unittest.TestCase):
     def test_guidance_names_limits(self):
         text = T.native_guidance(T.plan_tools(HERMES, ALL_NATIVE))
         for needle in ("Hermes current working directory", "hidden:true is refused", "at most 5 questions",
-                       "Native edit, patch and shell are not available"):
+                       "not available in this session"):
             self.assertIn(needle, text)
 
 
