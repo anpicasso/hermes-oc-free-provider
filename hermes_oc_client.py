@@ -762,6 +762,17 @@ class OpenCodeClient:
         hermes_session_context: Any = None,
         **kwargs: Any,
     ) -> Completion:
+        dump_path = os.environ.get("OC_DUMP_KWARGS")
+        if dump_path:
+            with open(dump_path, "a") as f:
+                f.write(json.dumps({
+                    "messages": messages, "tools": tools, "model": model, "stream": stream,
+                    "tool_choice": tool_choice, "max_tokens": max_tokens,
+                    "max_completion_tokens": max_completion_tokens, "temperature": temperature,
+                    "top_p": top_p, "stop": stop, "response_format": response_format,
+                    "reasoning_effort": reasoning_effort, "extra_body": extra_body,
+                    "kwargs": {k: repr(v)[:200] for k, v in kwargs.items()},
+                }) + "\n")
         self._validate_request(
             stream=stream,
             tool_choice=tool_choice,

@@ -572,6 +572,10 @@ class NativeRuntime:
         }
         for key, value in self.config_overrides.items():
             config[key] = value
+        capture = os.environ.get("OC_CAPTURE_URL")
+        if capture:
+            # Experiment capture: route the provider through a local logging proxy.
+            config["provider"] = {"opencode": {"options": {"baseURL": capture}}}
         config_path = self.workspace / "opencode.json"
         config_path.write_text(json.dumps(config, indent=2))
         try:

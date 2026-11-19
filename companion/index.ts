@@ -36,7 +36,7 @@ const EVENT_LOG_LIMIT = 512
 // to an enabled Hermes tool by oc_translate.NATIVE_MAP). Python names the exact
 // subset per generation (`nativeTools`); everything else is removed by
 // identity, and a native name a Hermes registration owns stays Hermes'.
-const TRANSLATED_NATIVE = new Set(["read", "write", "glob", "grep", "question", "todowrite"])
+const TRANSLATED_NATIVE = new Set(["read", "write", "glob", "grep", "question", "todowrite", "bash", "shell", "edit", "skill", "task", "subagent", "webfetch", "websearch"])
 
 // Bounds for the response parser. Everything else is counters only, so a
 // hostile or huge stream cannot grow plugin memory without limit.
