@@ -1,14 +1,18 @@
 # oc-free-provider
 
-> **Retired — repository archived; catalog delisting requested.**
+> **Unmaintained — repository remains unarchived; catalog delisting requested.**
 >
-> This plugin is no longer maintained or recommended for use. OpenCode restricts
-> its free-tier chat models to its own client. The v4.3.0 workaround renamed
-> Hermes's `terminal` tool to `bash` to get past that enforcement. Hermes
-> maintainers declined to list the update because disguising requests to bypass
-> a vendor restriction crosses the catalog's policy boundary, even when using
-> the official unmodified OpenCode binary. We accept that decision and are
-> retiring the project rather than pursuing further workarounds.
+> Development and maintenance have ended. **As of November 22, 2026
+> (America/Lima), the maintainer reports that both branches were working.**
+> This is their last-known operational status, not a new independent test or a
+> guarantee of future availability. Delisting is a policy and maintenance
+> decision, not a claim that both implementations stopped working.
+>
+> OpenCode restricts its free-tier chat models to its own client. Hermes
+> maintainers declined the v4.3.0 update because renaming `terminal` to `bash`
+> to pass the vendor's enforcement crosses the catalog's policy boundary, even
+> when using the official unmodified binary. We accept that decision and will
+> not maintain further workarounds.
 >
 > See the [Hermes catalog admission policies](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission),
 > the [maintainer's policy decision](https://github.com/NousResearch/hermes-agent/pull/155240#issuecomment-7076931782),
@@ -16,15 +20,37 @@
 > [Delisting PR #159066](https://github.com/NousResearch/hermes-agent/pull/159066)
 > requests removal of the existing v3.0.0 catalog entry; opening the PR does not
 > itself remove the listing. This is ordinary delisting, not a security blocklist.
->
-> **For existing users:** switch to another supported provider first, then run
-> `hermes plugins remove oc-free-provider` in each affected profile (use
-> `hermes --profile <name> plugins remove oc-free-provider` for a named profile).
-> Delisting and archiving do not uninstall or disable existing copies.
->
-> The public repository, tags and history are retained for reference. Everything
-> below is historical documentation, not a current support, availability or
-> installation recommendation; the earlier workaround guidance is withdrawn.
+
+## Branches and last-known status
+
+- **[`main`](https://github.com/anpicasso/hermes-oc-free-provider/tree/main)**
+  runs the user's official, unmodified `opencode serve` binary with a bundled
+  companion. OpenCode handles model inference; Hermes retains the agent loop,
+  canonical history, approvals and local tool execution. The adapter translates
+  selected native tool calls and registers Hermes tools, including the v4.3.0
+  `terminal` → `bash` wire rename discussed in the policy decision.
+- **[`alt/non-cli-spoof-poc`](https://github.com/anpicasso/hermes-oc-free-provider/tree/alt/non-cli-spoof-poc)**
+  is the alternative direct-transport implementation. It does not run OpenCode
+  CLI, `opencode serve` or ACP: Python handles model discovery, and a Bun
+  subprocess sends inference requests while reproducing OpenCode client
+  characteristics. Hermes still owns the loop and executes tools locally, with
+  bidirectional tool translation. Despite its branch name, this implementation
+  does emulate the client's identity; it is not a documented vendor-supported
+  integration.
+
+**Both branches are unmaintained.** The repository remains public and
+unarchived, with both branches, tags and history available. A working request
+is not evidence of vendor permission or catalog approval. Neither implementation
+has a commitment to future fixes, compatibility updates or support.
+
+**For existing users:** prefer another supported provider. If removing this
+plugin, switch providers first, then run `hermes plugins remove oc-free-provider`
+in each affected profile (or
+`hermes --profile <name> plugins remove oc-free-provider` for a named profile).
+Delisting does not uninstall or disable existing copies.
+
+Everything below is historical implementation documentation, not a current
+support or installation recommendation; earlier workaround guidance is withdrawn.
 
 ---
 
